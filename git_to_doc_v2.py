@@ -54,7 +54,7 @@ except ImportError:
 
 # ── Ollama endpoint ──────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "gemma3:4b"  # gemma3:1b for speed, gemma3:12b for quality
+DEFAULT_MODEL = "gemma3:12b"  # 12b hallucinates far less; 4b for speed, 1b is risky
 
 # ── budget: how much raw diff detail we send alongside the structured digest ──
 MAX_RAW_DIFF_CHARS = 6_000
@@ -381,7 +381,7 @@ def analyze(files: list[FileChange]) -> DiffAnalysis:
 
     # ── deterministic type resolution ───────────────────────────────────────
     type_guess, confident = _resolve_type(
-        cats, files, new_symbols, gone_symbols, added_files
+        cats, new_symbols, gone_symbols, added_files
     )
 
     # ── breaking-change heuristic ────────────────────────────────────────────
@@ -430,7 +430,7 @@ def analyze(files: list[FileChange]) -> DiffAnalysis:
     )
 
 
-def _resolve_type(cats, files, new_symbols, gone_symbols, added_files):
+def _resolve_type(cats, new_symbols, gone_symbols, added_files):
     """Return (type, confident). Confident types skip the model's judgement."""
     non_other = cats - {"other", "config"}
 
@@ -569,7 +569,7 @@ def call_gemma(prompt: str, model: str, retries: int = 1) -> str:
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.1,   # low → deterministic, structured output
+            "temperature": 0.0,   # greedy → most grounded, least invented detail
             "top_p": 0.9,
             "top_k": 40,
             "repeat_penalty": 1.1,
@@ -579,7 +579,7 @@ def call_gemma(prompt: str, model: str, retries: int = 1) -> str:
     }).encode()
 
     last_err = ""
-    for attempt in range(retries + 1):
+    for _ in range(retries + 1):
         req = urllib.request.Request(
             OLLAMA_URL, data=payload,
             headers={"Content-Type": "application/json"}, method="POST",
@@ -620,8 +620,12 @@ ONLY source of truth. Do not use any prior knowledge about this project.
 GROUNDING RULES (most important):
 - Describe ONLY what the digest shows. Never mention a file, function, feature,
   fix, or dependency that is not listed in the digest.
-- If you are unsure what the code does, describe the change literally from the
-  file list (e.g. "update N modules", "add <file>") rather than guessing intent.
+- A scope keyword (e.g. "json") is NOT evidence of a feature. Do not invent a
+  capability just because a word appears in a path or scope list.
+- If a file has NO "+symbols"/"-symbols" listed, you do NOT know what changed
+  inside it — refer to it only as modified/added/removed, never guess its purpose.
+- When in doubt, summarise from the CHANGE PROFILE (counts and categories)
+  rather than inventing specifics.
 - Do NOT add a "BREAKING CHANGE:" footer unless the digest contains the exact
   line "Breaking-change signal: YES".
 
@@ -629,10 +633,15 @@ FORMAT RULES:
 - Header: <type>(<scope>): <summary in imperative mood, no period, <=72 chars>
 - Valid types: feat, fix, docs, style, refactor, perf, test, chore, ci, build
 - Use this type unless the digest clearly contradicts it: {type_hint}
-- Choose <scope> from these candidates: {scopes}
+- Scope: pick the candidate covering the MOST changed files: {scopes}. If the
+  change spans many modules, use the broadest one or omit the scope entirely.
 - After the header, ONE blank line, then 2-4 sentences on WHAT changed and WHY,
   grounded entirely in the digest.
 - Output ONLY the commit message. No code fences, no preamble.
+
+Example of GOOD grounding: if the digest shows 19 source files modified with no
+symbols and 4 new files, write "modify 19 modules and add 4 files" — NOT a
+made-up feature about one of them.
 
 {digest}
 """
@@ -646,14 +655,17 @@ this project — if it is not in the digest, it did not happen.
 GROUNDING RULES (most important):
 - Every bullet MUST correspond to a file or symbol that actually appears in the
   digest. Never invent features, bug fixes, or "security" items.
-- When many files changed the same way, write ONE summarising bullet
-  (e.g. "Add type hints across 19 modules") instead of fabricating details.
-- Only emit a #### Security bullet if the digest explicitly shows a security fix.
+- Write ONE bullet per GROUP of similar changes, never one bullet per file.
+  e.g. "Add type hints across 19 modules" — NOT a separate guessed line per file.
+- If a file has no "+symbols"/"-symbols", do not describe its internal purpose;
+  fold it into a grouped count ("update N modules").
+- Do NOT guess intent words like "improve", "fix", "optimize", "simplify" for a
+  file unless the digest shows evidence for it.
 
 FORMAT RULES:
 - First line exactly: ### [Unreleased] — {today}
-- Then bullet lists under only the subsections that apply:
-  #### Added  #### Changed  #### Fixed  #### Removed  #### Security
+- Then bullet lists under ONLY the subsections that have real content. NEVER
+  output an empty section header (no bare "#### Removed" / "#### Security").
 - Map intent honestly: feat->Added, fix->Fixed, refactor/perf->Changed, removals->Removed.
 - Each bullet: present tense, plain English, <=100 chars.
 - Output ONLY the Markdown. No code fences, no preamble.
@@ -783,12 +795,34 @@ def enforce_changelog_header(changelog: str, today: str) -> str:
     """
     want = f"### [Unreleased] — {today}"
     lines = changelog.splitlines()
-    # find any existing line that mentions Unreleased and replace it in place
+    # normalise the header line (replace any existing "Unreleased" line in place)
+    if any("unreleased" in l.lower() for l in lines):
+        lines = [want if "unreleased" in l.lower() else l for l in lines]
+    else:
+        lines = [want, ""] + lines
+    return _drop_empty_sections(lines)
+
+
+_SECTION_RE = re.compile(r"^\s*#{2,4}\s+(Added|Changed|Fixed|Removed|Security)\s*$",
+                         re.IGNORECASE)
+
+
+def _drop_empty_sections(lines: list[str]) -> str:
+    """Remove any "#### Section" header that is not followed by a real bullet,
+    so the model can never leave bare empty sections in the output."""
+    keep = [True] * len(lines)
     for i, l in enumerate(lines):
-        if "unreleased" in l.lower():
-            lines[i] = want
-            return "\n".join(lines).strip()
-    return f"{want}\n\n" + changelog.strip()
+        if _SECTION_RE.match(l):
+            has_bullet = False
+            for nxt in lines[i + 1:]:
+                if _SECTION_RE.match(nxt):
+                    break
+                if nxt.strip().startswith(("-", "*", "•")):
+                    has_bullet = True
+                    break
+            if not has_bullet:
+                keep[i] = False
+    return "\n".join(l for l, k in zip(lines, keep) if k).strip()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
