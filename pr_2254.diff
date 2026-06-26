@@ -1,0 +1,75 @@
+diff --git a/CHANGES b/CHANGES
+index 4fd46d7157..d7f15d66a1 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -25,11 +25,14 @@ Major release, unreleased
+   adding OPTIONS method when the ``view_func`` argument is not a class.
+   (`#1489`_).
+ - ``MethodView`` can inherit method handlers from base classes. (`#1936`_)
++- Errors caused while opening the session at the beginning of the request are
++  handled by the app's error handlers. (`#2254`_)
+ 
+ .. _#1489: https://github.com/pallets/flask/pull/1489
+ .. _#1936: https://github.com/pallets/flask/pull/1936
+ .. _#2017: https://github.com/pallets/flask/pull/2017
+ .. _#2223: https://github.com/pallets/flask/pull/2223
++.. _#2254: https://github.com/pallets/flask/pull/2254
+ 
+ Version 0.12.1
+ --------------
+diff --git a/flask/app.py b/flask/app.py
+index a054d23caf..1943cfcf83 100644
+--- a/flask/app.py
++++ b/flask/app.py
+@@ -2002,10 +2002,10 @@ def wsgi_app(self, environ, start_response):
+                                exception context to start the response
+         """
+         ctx = self.request_context(environ)
+-        ctx.push()
+         error = None
+         try:
+             try:
++                ctx.push()
+                 response = self.full_dispatch_request()
+             except Exception as e:
+                 error = e
+diff --git a/tests/test_reqctx.py b/tests/test_reqctx.py
+index 4b2b1f87f5..48823fb274 100644
+--- a/tests/test_reqctx.py
++++ b/tests/test_reqctx.py
+@@ -12,6 +12,7 @@
+ import pytest
+ 
+ import flask
++from flask.sessions import SessionInterface
+ 
+ try:
+     from greenlet import greenlet
+@@ -193,3 +194,27 @@ def g():
+ 
+     result = greenlets[0].run()
+     assert result == 42
++
++
++def test_session_error_pops_context():
++    class SessionError(Exception):
++        pass
++
++    class FailingSessionInterface(SessionInterface):
++        def open_session(self, app, request):
++            raise SessionError()
++
++    class CustomFlask(flask.Flask):
++        session_interface = FailingSessionInterface()
++
++    app = CustomFlask(__name__)
++
++    @app.route('/')
++    def index():
++        # shouldn't get here
++        assert False
++
++    response = app.test_client().get('/')
++    assert response.status_code == 500
++    assert not flask.request
++    assert not flask.current_app
