@@ -34,7 +34,7 @@ Also fixes naive datetime.utcnow() calls to use timezone-aware equivalents.
 
 ---
 
-## What it does
+## What it actually does
 
 Developers write terrible commit messages. They skip changelog updates. `git_to_doc` fixes both in one command by routing your diff through a local [Google Gemma](https://ai.google.dev/gemma) model and returning two structured, ready-to-paste outputs:
 
