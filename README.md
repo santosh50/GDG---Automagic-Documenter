@@ -271,13 +271,3 @@ Requires `matplotlib` (`pip install matplotlib`).
 | `bodies of N large file(s) omitted` note | Expected for huge diffs — only the first 6,000 chars of raw bodies are sent; structure is still complete |
 | `--chart requires matplotlib` | `pip install matplotlib` |
 | No GPU / low RAM | `gemma3:1b` or `gemma3:4b` run on CPU — slower, and 1b is less accurate |
-
----
-
-## Extension ideas
-
-- `--watch` mode — poll `git diff` every 30 seconds and auto-document as you code
-- `--append` — append the changelog entry directly to `CHANGELOG.md` in place
-- Batch mode — process a directory of `.diff` files in one pass
-- GitHub Action — post the generated commit message as a PR comment automatically
-- Git alias — wrap the script so `git doc` runs it on your latest diff
