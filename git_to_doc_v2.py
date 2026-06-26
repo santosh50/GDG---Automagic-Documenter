@@ -15,9 +15,10 @@ everything it can on its own, and hands Gemma a clean structured digest.
 Division of labour, chosen for accuracy:
   • Commit message → Gemma writes the human narrative (judgement helps here),
     then a deterministic validator repairs it to a spec-compliant header.
-  • Changelog     → generated deterministically from the parsed facts by
-    default, so it can never hallucinate, truncate, or come back empty.
-    Use --ai-changelog to have Gemma write it instead.
+  • Changelog     → Gemma writes descriptive "Added or Changed / Removed"
+    bullets in the Best-README-Template style; if it under-produces we fall
+    back to a deterministic, fully grounded renderer. Use
+    --deterministic-changelog to force the grounded version (zero hallucination).
 
 Usage:
   python git_to_doc_v2.py <path/to/file.diff>
@@ -42,7 +43,6 @@ import textwrap
 import urllib.request
 import urllib.error
 from pathlib import Path
-from datetime import date
 from dataclasses import dataclass, field, asdict
 from collections import Counter
 
@@ -663,7 +663,8 @@ made-up feature about one of them.
 {digest}
 """
 
-CHANGELOG_PROMPT = """You are a technical writer producing a Markdown changelog entry.
+CHANGELOG_PROMPT = """You are a technical writer producing a Markdown changelog entry in the
+popular "Best-README-Template" style.
 
 A deterministic analyzer has parsed the change; the commit type is: {ctype}
 The digest below is the ONLY source of truth. Do not use prior knowledge about
@@ -672,31 +673,41 @@ this project — if it is not in the digest, it did not happen.
 GROUNDING RULES (most important):
 - Every bullet MUST correspond to a file or symbol that actually appears in the
   digest. Never invent features, bug fixes, or "security" items.
-- Write ONE bullet per GROUP of similar changes, never one bullet per file.
-  e.g. "Add type hints across 19 modules" — NOT a separate guessed line per file.
-- If a file has no "+symbols"/"-symbols", do not describe its internal purpose;
-  fold it into a grouped count ("update N modules").
-- Do NOT guess intent words like "improve", "fix", "optimize", "simplify" for a
-  file unless the digest shows evidence for it.
+- Write meaningful bullets that describe WHAT changed, grouped by theme — never
+  one bullet per file. Collapse many similar files into one bullet.
+- If a file has no "+symbols"/"-symbols", do not guess its internal purpose;
+  describe it at the level the digest supports ("add type-hint support").
+- Do NOT guess intent words like "improve", "optimize", "simplify" without evidence.
 
-FORMAT RULES:
-- First line exactly: ### [Unreleased] — {today}
-- Use #### section headers. Put bullets under ONLY the sections that have real
-  content. NEVER output an empty section header (no bare "#### Security").
-- Map intent honestly: feat->Added, fix->Fixed, refactor/perf->Changed, removals->Removed.
-- HARD LIMIT: at most 6 bullets total for the whole entry. Group aggressively —
-  collapse many files in the same category into ONE bullet with a count.
-- Each bullet: present tense, plain English, <=100 chars.
+FORMAT (follow EXACTLY):
+## Changelog
+
+### {version}
+
+#### Added or Changed
+- <past-tense bullet>
+- <past-tense bullet>
+
+#### Removed
+- <past-tense bullet>
+
+RULES:
+- Put every addition, change, fix, refactor, or new feature under "Added or Changed".
+- Put ONLY deletions/removals under "Removed". OMIT the entire "#### Removed"
+  section if nothing was removed — never leave it empty.
+- Each bullet: past tense (Added/Changed/Fixed/Removed…), <=100 chars.
+- Aim for 3-7 bullets total.
 - Output ONLY the Markdown. No code fences, no preamble.
 
-Worked example — for a digest of "19 source modified, 4 added, 3 build, 1 ci":
-### [Unreleased] — 2025-01-01
-#### Added
-- Add 4 files including py.typed and typing.py
-#### Changed
-- Update 19 source modules
-- Update build config (setup.cfg, MANIFEST.in) and CI workflow
-(Note: 6 bullets max, grouped by category, no per-file lines, no guessed verbs.)
+Worked example — digest "19 source modified, 4 added (py.typed, typing.py), 3 build, 1 ci":
+## Changelog
+
+### {version}
+
+#### Added or Changed
+- Added type-hint support with a py.typed marker and typing module
+- Updated 18 source modules with type annotations
+- Updated build configuration and CI workflow
 
 {digest}
 """
@@ -799,8 +810,8 @@ def _trim_incomplete_tail(message: str) -> str:
     return f"{head}{sep}{body}" if sep else head
 
 
-def generate(analysis: DiffAnalysis, model: str, today: str,
-             ai_changelog: bool = False) -> tuple[str, str]:
+def generate(analysis: DiffAnalysis, model: str, version: str,
+             deterministic_changelog: bool = False) -> tuple[str, str]:
     digest = build_digest(analysis)
     scopes = ", ".join(analysis.scopes) or "(infer from paths)"
 
@@ -819,19 +830,19 @@ def generate(analysis: DiffAnalysis, model: str, today: str,
     # single source of truth: the type that actually shipped in the header
     resolved = parse_commit_type(commit) or analysis.type_guess
 
-    # Changelog: deterministic by default — built straight from the parsed facts
-    # so it can never hallucinate, truncate, or come back empty. The model is
-    # erratic at this on small/mid models, so we only use it when asked.
-    if ai_changelog:
+    # Changelog: Gemma writes descriptive prose by default; if it under-produces
+    # we fall back to the deterministic, fully grounded renderer so the output
+    # is never empty, truncated, or malformed.
+    if deterministic_changelog:
+        changelog = render_changelog(analysis, version)
+    else:
         changelog = call_gemma(
-            CHANGELOG_PROMPT.format(ctype=resolved, today=today, digest=digest),
+            CHANGELOG_PROMPT.format(ctype=resolved, version=version, digest=digest),
             model,
         )
-        changelog = enforce_changelog_header(changelog, today) if changelog else ""
-        if not changelog or "####" not in changelog:   # model under-produced → fall back
-            changelog = render_changelog(analysis, today, resolved)
-    else:
-        changelog = render_changelog(analysis, today, resolved)
+        changelog = enforce_changelog(changelog, version) if changelog else ""
+        if not changelog or "####" not in changelog:   # model under-produced
+            changelog = render_changelog(analysis, version)
 
     return commit, changelog
 
@@ -855,10 +866,9 @@ def _file_names(files: list[FileChange], show: int = 3) -> str:
     return shown
 
 
-def render_changelog(analysis: DiffAnalysis, today: str, ctype: str) -> str:
-    """Build a grouped, fully grounded changelog directly from the analysis.
-
-    Every line is derived from a real file or symbol — no model, so no
+def render_changelog(analysis: DiffAnalysis, version: str) -> str:
+    """Build a grounded changelog in the Best-README-Template style directly
+    from the analysis — "Added or Changed" + "Removed". No model, so no
     invention, no truncation, no empty output.
     """
     files = analysis.files
@@ -875,59 +885,53 @@ def render_changelog(analysis: DiffAnalysis, today: str, ctype: str) -> str:
         extra = f" (+{len(syms) - 6} more)" if len(syms) > 6 else ""
         return ", ".join(syms[:6]) + extra
 
-    added_b, changed_b, fixed_b, removed_b = [], [], [], []
+    changed_b, removed_b = [], []
 
     if added:
-        added_b.append(f"Added {_plural(len(added), 'file')}: {_file_names(added)}")
+        changed_b.append(f"Added {_plural(len(added), 'file')}: {_file_names(added)}")
     if new_syms:
-        added_b.append(f"Added API: {sym_list(new_syms)}")
+        changed_b.append(f"Added API: {sym_list(new_syms)}")
+    src_mod = [f for f in modified if f.category == "source"]
+    if src_mod:
+        changed_b.append(f"Updated {_plural(len(src_mod), 'source module')}")
+    other_mod = Counter(f.category for f in modified if f.category != "source")
+    for cat, n in other_mod.most_common():
+        changed_b.append(f"Updated {_plural(n, _CAT_NOUN.get(cat, 'file'))}")
 
     if deleted:
         removed_b.append(f"Removed {_plural(len(deleted), 'file')}: {_file_names(deleted)}")
     if gone_syms:
         removed_b.append(f"Removed API: {sym_list(gone_syms)}")
 
-    # modified files, grouped by category; source mods route to Fixed for a fix
-    src_mod = [f for f in modified if f.category == "source"]
-    if src_mod:
-        bullet = f"Updated {_plural(len(src_mod), 'source module')}"
-        (fixed_b if ctype == "fix" else changed_b).append(bullet)
-    other_mod = Counter(f.category for f in modified if f.category != "source")
-    for cat, n in other_mod.most_common():
-        changed_b.append(f"Updated {_plural(n, _CAT_NOUN.get(cat, 'file'))}")
-
-    sections = [("Added", added_b), ("Changed", changed_b),
-                ("Fixed", fixed_b), ("Removed", removed_b)]
-    lines = [f"### [Unreleased] — {today}"]
-    for head, bullets in sections:
-        if not bullets:
-            continue
-        lines.append("")
-        lines.append(f"#### {head}")
-        lines.extend(f"- {b}" for b in bullets)
-    if len(lines) == 1:                       # nothing classifiable — never empty
-        lines += ["", "#### Changed", f"- Updated {_plural(len(files), 'file')}"]
+    lines = ["## Changelog", "", f"### {version}"]
+    if changed_b:
+        lines += ["", "#### Added or Changed"] + [f"- {b}" for b in changed_b]
+    if removed_b:
+        lines += ["", "#### Removed"] + [f"- {b}" for b in removed_b]
+    if not changed_b and not removed_b:       # never empty
+        lines += ["", "#### Added or Changed",
+                  f"- Updated {_plural(len(files), 'file')}"]
     return "\n".join(lines)
 
 
-def enforce_changelog_header(changelog: str, today: str) -> str:
-    """Guarantee the entry opens with the exact Keep-a-Changelog header line.
-
-    Small models drop or reword the header; we normalise it deterministically
-    so the snippet is always pasteable into a real CHANGELOG/README.
-    """
-    want = f"### [Unreleased] — {today}"
-    lines = changelog.splitlines()
-    # normalise the header line (replace any existing "Unreleased" line in place)
-    if any("unreleased" in l.lower() for l in lines):
-        lines = [want if "unreleased" in l.lower() else l for l in lines]
-    else:
-        lines = [want, ""] + lines
-    return _drop_empty_sections(lines)
+def enforce_changelog(changelog: str, version: str) -> str:
+    """Normalise a model-written changelog to the Best-README-Template shape:
+    drop empty sections and guarantee the "## Changelog" / "### <version>"
+    headings so the snippet is always pasteable."""
+    text = _drop_empty_sections(changelog.splitlines())
+    lines = text.splitlines()
+    has_heading = any(
+        l.strip().lstrip("# ").lower().startswith("changelog") for l in lines[:3]
+    )
+    if not has_heading:
+        lines = ["## Changelog", "", f"### {version}", ""] + lines
+    return "\n".join(lines).strip()
 
 
-_SECTION_RE = re.compile(r"^\s*#{2,4}\s+(Added|Changed|Fixed|Removed|Security)\s*$",
-                         re.IGNORECASE)
+_SECTION_RE = re.compile(
+    r"^\s*#{2,4}\s+(Added or Changed|Added|Changed|Fixed|Removed|Security)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _drop_empty_sections(lines: list[str]) -> str:
@@ -1021,9 +1025,7 @@ def save_output(commit_msg, changelog, analysis, out_path: Path):
         commit_msg,
         "```",
         "",
-        "## Changelog Entry",
-        "",
-        changelog,
+        changelog,        # already begins with its own "## Changelog" heading
         "",
     ])
     out_path.write_text(content, encoding="utf-8")
@@ -1055,7 +1057,8 @@ def main():
               python git_to_doc_v2.py pr_42.txt --model gemma3:1b
               python git_to_doc_v2.py changes.diff --output entry.md
               python git_to_doc_v2.py changes.diff --json
-              python git_to_doc_v2.py changes.diff --ai-changelog
+              python git_to_doc_v2.py changes.diff --version v1.2.0
+              python git_to_doc_v2.py changes.diff --deterministic-changelog
               python git_to_doc_v2.py changes.diff --chart changes.png
         """),
     )
@@ -1066,9 +1069,12 @@ def main():
                         help="Optional: save output to this .md file")
     parser.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON instead of formatted text")
-    parser.add_argument("--ai-changelog", action="store_true",
-                        help="Let Gemma write the changelog prose (default: "
-                             "deterministic, fully grounded changelog)")
+    parser.add_argument("--version", default="Unreleased",
+                        help="Version label for the changelog entry "
+                             "(default: Unreleased; e.g. v1.2.0)")
+    parser.add_argument("--deterministic-changelog", action="store_true",
+                        help="Skip Gemma for the changelog and build it purely "
+                             "from the parsed facts (zero hallucination)")
     parser.add_argument("--chart", type=Path, default=None,
                         help="Also render a PNG of the change structure "
                              "(requires matplotlib)")
@@ -1085,9 +1091,10 @@ def main():
     if not args.json:
         print(f"🔍  Analysing {args.diff_file.name} with {args.model} …", file=sys.stderr)
 
-    today = date.today().isoformat()
-    commit_msg, changelog = generate(analysis, args.model, today,
-                                     ai_changelog=args.ai_changelog)
+    commit_msg, changelog = generate(
+        analysis, args.model, args.version,
+        deterministic_changelog=args.deterministic_changelog,
+    )
 
     print_results(commit_msg, changelog, analysis, args.json)
     if args.output:
