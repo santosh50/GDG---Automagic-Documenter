@@ -198,9 +198,3 @@ Two separate model calls are made intentionally — one focused prompt per outpu
 - Batch mode — process a directory of `.diff` files in one pass
 - GitHub Action — post the generated commit message as a PR comment automatically
 - Git alias — wrap the script so `git doc` runs it on your latest diff
-
----
-
-## License
-
-MIT
