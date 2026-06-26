@@ -384,9 +384,11 @@ def analyze(files: list[FileChange]) -> DiffAnalysis:
     deleted_files = [f for f in files if f.kind == "deleted"]
     deleted_source = [f for f in deleted_files if f.category == "source"]
 
+    added_source = [f for f in added_files if f.category == "source"]
+
     # ── deterministic type resolution ───────────────────────────────────────
     type_guess, confident = _resolve_type(
-        cats, new_symbols, gone_symbols, added_files
+        cats, new_symbols, gone_symbols, added_source
     )
 
     # ── breaking-change heuristic ────────────────────────────────────────────
@@ -435,7 +437,7 @@ def analyze(files: list[FileChange]) -> DiffAnalysis:
     )
 
 
-def _resolve_type(cats, new_symbols, gone_symbols, added_files):
+def _resolve_type(cats, new_symbols, gone_symbols, added_source):
     """Return (type, confident). Confident types skip the model's judgement."""
     non_other = cats - {"other", "config"}
 
@@ -451,12 +453,20 @@ def _resolve_type(cats, new_symbols, gone_symbols, added_files):
     if not non_other and cats <= {"config", "other"}:
         return "chore", True
 
-    # everything below touches real source → needs semantic judgement.
-    # we hand the model a strong prior but mark it non-confident.
-    if added_files and new_symbols and not gone_symbols:
-        return "feat", False           # new files + new API, nothing removed
+    # no real source code touched → this is tooling/maintenance, not a fix.
+    # lean on whatever non-source category dominates (build > ci > chore).
+    if "source" not in cats:
+        if "build" in cats:
+            return "build", False
+        if "ci" in cats:
+            return "ci", False
+        return "chore", False
+
+    # source touched → semantic judgement; hand the model a strong prior.
+    if added_source and not gone_symbols:
+        return "feat", False           # new source files, nothing removed → feature
     if new_symbols and not gone_symbols:
-        return "feat", False
+        return "feat", False           # new public API, nothing removed → feature
     return "fix", False                # conservative default for edits-in-place
 
 
@@ -850,23 +860,23 @@ def render_changelog(analysis: DiffAnalysis, today: str, ctype: str) -> str:
     added_b, changed_b, fixed_b, removed_b = [], [], [], []
 
     if added:
-        added_b.append(f"Add {_plural(len(added), 'file')}: {_file_names(added)}")
+        added_b.append(f"Added {_plural(len(added), 'file')}: {_file_names(added)}")
     if new_syms:
-        added_b.append(f"Add API: {sym_list(new_syms)}")
+        added_b.append(f"Added API: {sym_list(new_syms)}")
 
     if deleted:
-        removed_b.append(f"Remove {_plural(len(deleted), 'file')}: {_file_names(deleted)}")
+        removed_b.append(f"Removed {_plural(len(deleted), 'file')}: {_file_names(deleted)}")
     if gone_syms:
-        removed_b.append(f"Remove API: {sym_list(gone_syms)}")
+        removed_b.append(f"Removed API: {sym_list(gone_syms)}")
 
     # modified files, grouped by category; source mods route to Fixed for a fix
     src_mod = [f for f in modified if f.category == "source"]
     if src_mod:
-        bullet = f"Update {_plural(len(src_mod), 'source module')}"
+        bullet = f"Updated {_plural(len(src_mod), 'source module')}"
         (fixed_b if ctype == "fix" else changed_b).append(bullet)
     other_mod = Counter(f.category for f in modified if f.category != "source")
     for cat, n in other_mod.most_common():
-        changed_b.append(f"Update {_plural(n, _CAT_NOUN.get(cat, 'file'))}")
+        changed_b.append(f"Updated {_plural(n, _CAT_NOUN.get(cat, 'file'))}")
 
     sections = [("Added", added_b), ("Changed", changed_b),
                 ("Fixed", fixed_b), ("Removed", removed_b)]
@@ -878,7 +888,7 @@ def render_changelog(analysis: DiffAnalysis, today: str, ctype: str) -> str:
         lines.append(f"#### {head}")
         lines.extend(f"- {b}" for b in bullets)
     if len(lines) == 1:                       # nothing classifiable — never empty
-        lines += ["", "#### Changed", f"- Update {_plural(len(files), 'file')}"]
+        lines += ["", "#### Changed", f"- Updated {_plural(len(files), 'file')}"]
     return "\n".join(lines)
 
 
