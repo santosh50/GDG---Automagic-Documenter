@@ -491,6 +491,19 @@ def _budget_raw_diff(files: list[FileChange], limit: int) -> tuple[str, int, int
 def build_digest(analysis: DiffAnalysis) -> str:
     """A clean structured summary + budgeted raw detail."""
     lines = ["=== STRUCTURED SUMMARY ==="]
+
+    # CHANGE PROFILE — a fact-dense headline the model cannot ignore. This is
+    # the deterministic anchor that keeps small models from free-associating.
+    cat_counts = Counter(f.category for f in analysis.files)
+    kind_counts = Counter(f.kind for f in analysis.files)
+    profile = ", ".join(f"{n} {c}" for c, n in cat_counts.most_common())
+    kinds = ", ".join(f"{n} {k}" for k, n in kind_counts.most_common())
+    lines.append(
+        f"CHANGE PROFILE: {len(analysis.files)} file(s) [{kinds}] "
+        f"across categories: {profile}. "
+        f"Net +{analysis.total_additions}/-{analysis.total_deletions} lines."
+    )
+    lines.append("")
     lines.append("Files changed:")
     for f in analysis.files:
         sym = ""
@@ -601,15 +614,24 @@ def call_gemma(prompt: str, model: str, retries: int = 1) -> str:
 
 COMMIT_PROMPT = """You are an expert software engineer writing ONE Conventional Commit message.
 
-A deterministic analyzer has already parsed the change. Trust its structured summary.
+A deterministic analyzer has already parsed the change. The digest below is the
+ONLY source of truth. Do not use any prior knowledge about this project.
 
-Rules:
-- Format: <type>(<scope>): <summary in imperative mood, no period, <=72 chars>
+GROUNDING RULES (most important):
+- Describe ONLY what the digest shows. Never mention a file, function, feature,
+  fix, or dependency that is not listed in the digest.
+- If you are unsure what the code does, describe the change literally from the
+  file list (e.g. "update N modules", "add <file>") rather than guessing intent.
+- Do NOT add a "BREAKING CHANGE:" footer unless the digest contains the exact
+  line "Breaking-change signal: YES".
+
+FORMAT RULES:
+- Header: <type>(<scope>): <summary in imperative mood, no period, <=72 chars>
 - Valid types: feat, fix, docs, style, refactor, perf, test, chore, ci, build
-- Use this type unless the diff clearly contradicts it: {type_hint}
+- Use this type unless the digest clearly contradicts it: {type_hint}
 - Choose <scope> from these candidates: {scopes}
-- After the header, ONE blank line, then 2-4 sentences explaining WHAT changed and WHY.
-- If the analyzer flagged a breaking change, add a final line: BREAKING CHANGE: <what breaks>
+- After the header, ONE blank line, then 2-4 sentences on WHAT changed and WHY,
+  grounded entirely in the digest.
 - Output ONLY the commit message. No code fences, no preamble.
 
 {digest}
@@ -618,13 +640,22 @@ Rules:
 CHANGELOG_PROMPT = """You are a technical writer producing a Markdown changelog entry.
 
 A deterministic analyzer has parsed the change; the commit type is: {ctype}
+The digest below is the ONLY source of truth. Do not use prior knowledge about
+this project — if it is not in the digest, it did not happen.
 
-Rules:
+GROUNDING RULES (most important):
+- Every bullet MUST correspond to a file or symbol that actually appears in the
+  digest. Never invent features, bug fixes, or "security" items.
+- When many files changed the same way, write ONE summarising bullet
+  (e.g. "Add type hints across 19 modules") instead of fabricating details.
+- Only emit a #### Security bullet if the digest explicitly shows a security fix.
+
+FORMAT RULES:
 - First line exactly: ### [Unreleased] — {today}
 - Then bullet lists under only the subsections that apply:
   #### Added  #### Changed  #### Fixed  #### Removed  #### Security
 - Map intent honestly: feat->Added, fix->Fixed, refactor/perf->Changed, removals->Removed.
-- Each bullet: present tense, plain English, <=100 chars, describe user-visible impact.
+- Each bullet: present tense, plain English, <=100 chars.
 - Output ONLY the Markdown. No code fences, no preamble.
 
 {digest}
@@ -696,8 +727,12 @@ def enforce_commit_format(message: str, analysis: "DiffAnalysis") -> str:
     elif analysis.scopes:
         scope = analysis.scopes[0]
 
-    # 3. breaking marker: honour the analyzer if it detected a break
-    bang = "!" if (bang or analysis.breaking) else ""
+    # 3. breaking marker: the analyzer is AUTHORITATIVE. Small models love to
+    #    invent "BREAKING CHANGE" footers — if no breaking signal was detected,
+    #    strip both the ! marker and any fabricated footer from the body.
+    bang = "!" if analysis.breaking else ""
+    if not analysis.breaking:
+        lines = [l for l in lines if not l.strip().upper().startswith("BREAKING CHANGE")]
 
     # 4. summary: no trailing period, fit the whole header under HEADER_MAX
     prefix = f"{ctype}({scope}){bang}: " if scope else f"{ctype}{bang}: "
@@ -736,7 +771,24 @@ def generate(analysis: DiffAnalysis, model: str, today: str) -> tuple[str, str]:
         bucket = {"feat": "Added", "fix": "Fixed"}.get(resolved, "Changed")
         changelog = f"### [Unreleased] — {today}\n\n#### {bucket}\n- {commit.splitlines()[0]}"
 
+    changelog = enforce_changelog_header(changelog, today)
     return commit, changelog
+
+
+def enforce_changelog_header(changelog: str, today: str) -> str:
+    """Guarantee the entry opens with the exact Keep-a-Changelog header line.
+
+    Small models drop or reword the header; we normalise it deterministically
+    so the snippet is always pasteable into a real CHANGELOG/README.
+    """
+    want = f"### [Unreleased] — {today}"
+    lines = changelog.splitlines()
+    # find any existing line that mentions Unreleased and replace it in place
+    for i, l in enumerate(lines):
+        if "unreleased" in l.lower():
+            lines[i] = want
+            return "\n".join(lines).strip()
+    return f"{want}\n\n" + changelog.strip()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
