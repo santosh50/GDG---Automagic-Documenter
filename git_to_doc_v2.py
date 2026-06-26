@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-git_to_doc.py — Automagic Documenter
-=====================================
+git_to_doc_v2.py — Automagic Documenter (accuracy engine)
+=========================================================
 Takes a raw git diff (.diff or .txt) and routes it through a local
 Google Gemma model (via Ollama) to produce:
   1. A Conventional Commit message
@@ -15,10 +15,10 @@ The model is only asked to do what it is actually good at: write short
 prose for the parts that genuinely need judgement.
 
 Usage:
-  python git_to_doc.py <path/to/file.diff>
-  python git_to_doc.py <path/to/file.diff> --output changelog.md
-  python git_to_doc.py <path/to/file.diff> --model gemma3:4b
-  python git_to_doc.py <path/to/file.diff> --json
+  python git_to_doc_v2.py <path/to/file.diff>
+  python git_to_doc_v2.py <path/to/file.diff> --output changelog.md
+  python git_to_doc_v2.py <path/to/file.diff> --model gemma3:4b
+  python git_to_doc_v2.py <path/to/file.diff> --json
 
 Requirements:
   # Pure standard library — no pip install required.
@@ -109,6 +109,12 @@ def classify_file(path: str) -> tuple[str, str]:
 
     language = LANG_BY_EXT.get(ext, "other")
 
+    # example / demo / benchmark code — real source, but NOT public API, so a
+    # change here (even a deletion) must never count as a feature or a break.
+    if any(seg in {"example", "examples", "demo", "demos", "sample", "samples",
+                   "benchmark", "benchmarks"} for seg in ("/" + p).split("/")):
+        return language, "example"
+
     # CI configuration
     if "/.github/workflows/" in "/" + p or p.startswith(".github/workflows/"):
         return language, "ci"
@@ -123,17 +129,18 @@ def classify_file(path: str) -> tuple[str, str]:
     if name in BUILD_FILES:
         return language, "build"
 
-    # tests
-    if (
-        "/test" in "/" + p
-        or "/tests/" in "/" + p
-        or name.startswith("test_")
+    # tests — match test *directories* or test-named *files*, never a bare
+    # substring (so "flask/testing.py" and "docs/testing.rst" are NOT tests).
+    segments = ("/" + p).split("/")
+    in_test_dir = any(seg in {"test", "tests", "__tests__", "spec"} for seg in segments)
+    test_named = (
+        name.startswith("test_")
         or name.endswith("_test.py")
-        or name.endswith(".test.js")
-        or name.endswith(".spec.js")
-        or name.endswith(".test.ts")
-        or name.endswith(".spec.ts")
-    ):
+        or name.endswith("_test.go")
+        or name.endswith((".test.js", ".spec.js", ".test.jsx", ".spec.jsx"))
+        or name.endswith((".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx"))
+    )
+    if in_test_dir or test_named:
         return language, "test"
 
     # docs
@@ -204,7 +211,7 @@ class FileChange:
     path: str
     kind: str               # added | deleted | modified | renamed
     language: str
-    category: str           # docs | test | ci | build | config | source | other
+    category: str           # docs | test | ci | build | config | source | example | other
     additions: int = 0
     deletions: int = 0
     binary: bool = False
@@ -232,8 +239,18 @@ class DiffAnalysis:
 # 4. PARSER  — raw unified diff → list[FileChange]
 # ═════════════════════════════════════════════════════════════════════════════
 
-_DIFF_GIT = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+# Accept both prefixed (`a/x b/x`, the default) and unprefixed (`--no-prefix`,
+# `diff.noprefix=true`) headers so we parse any unified git diff.
+_DIFF_GIT = re.compile(r"^diff --git (.+?) (.+)$")
 _HUNK = re.compile(r"^@@ .* @@")
+
+
+def _strip_diff_prefix(path: str, side: str) -> str:
+    """Drop a leading a/ or b/ (or matching quoted form) from a diff path."""
+    path = path.strip().strip('"')
+    if path.startswith(f"{side}/"):
+        return path[2:]
+    return path
 
 
 def parse_diff(text: str) -> list[FileChange]:
@@ -259,11 +276,12 @@ def parse_diff(text: str) -> list[FileChange]:
             if cur is not None:
                 finalize(cur)
             added_code, removed_code = [], []
-            new_path = m.group(2).strip()
+            new_path = _strip_diff_prefix(m.group(2), "b")
+            old_path = _strip_diff_prefix(m.group(1), "a")
             lang, cat = classify_file(new_path)
             cur = FileChange(
                 path=new_path, kind="modified", language=lang, category=cat,
-                old_path=m.group(1).strip(), raw_lines=[line], header_lines=[line],
+                old_path=old_path, raw_lines=[line], header_lines=[line],
             )
             continue
 
@@ -307,10 +325,21 @@ def parse_diff(text: str) -> list[FileChange]:
 # 5. ANALYZER  — deterministic insight engine
 # ═════════════════════════════════════════════════════════════════════════════
 
+_SKIP_SCOPE_STEMS = {
+    "changes", "changelog", "authors", "contributing",
+    "readme", "license", "notice", "manifest",
+}
+
+
 def _infer_scope(files: list[FileChange]) -> list[str]:
-    """Candidate scopes drawn from real paths, most common first."""
+    """Candidate scopes drawn from real paths, most common first.
+
+    Prefer source/test files — a commit scope should name the code that
+    changed, not the changelog or AUTHORS file that came along with it.
+    """
+    candidates = [f for f in files if f.category in {"source", "test"}] or files
     counter: Counter[str] = Counter()
-    for fc in files:
+    for fc in candidates:
         parts = fc.path.split("/")
         # prefer a meaningful directory; skip leading src/lib/app shells
         meaningful = [p for p in parts[:-1] if p not in {"src", "lib", "app", "."}]
@@ -318,6 +347,8 @@ def _infer_scope(files: list[FileChange]) -> list[str]:
             counter[meaningful[-1]] += 1
         else:
             stem = parts[-1].rsplit(".", 1)[0]
+            if stem.lower() in _SKIP_SCOPE_STEMS:
+                continue
             counter[stem] += 1
     return [name for name, _ in counter.most_common(3)]
 
@@ -338,10 +369,15 @@ def analyze(files: list[FileChange]) -> DiffAnalysis:
     dep_changes = _detect_dependency_changes(files)
     scopes = _infer_scope(files)
 
-    new_symbols = [s for f in files for s in f.added_symbols]
-    gone_symbols = [s for f in files for s in f.removed_symbols]
+    # Type / breaking signals are driven by SOURCE files only — symbols that
+    # appear in tests, docs or configs are not part of the public API surface
+    # and must not push the change toward feat/breaking.
+    src_files = [f for f in files if f.category == "source"]
+    new_symbols = [s for f in src_files for s in f.added_symbols]
+    gone_symbols = [s for f in src_files for s in f.removed_symbols]
     added_files = [f for f in files if f.kind == "added"]
     deleted_files = [f for f in files if f.kind == "deleted"]
+    deleted_source = [f for f in deleted_files if f.category == "source"]
 
     # ── deterministic type resolution ───────────────────────────────────────
     type_guess, confident = _resolve_type(
@@ -349,7 +385,9 @@ def analyze(files: list[FileChange]) -> DiffAnalysis:
     )
 
     # ── breaking-change heuristic ────────────────────────────────────────────
-    breaking = bool(deleted_files) or bool(
+    # Only a removed *source* file or a removed *public source* symbol breaks
+    # callers. Deleting an image, a test, or a doc never does.
+    breaking = bool(deleted_source) or bool(
         [s for s in gone_symbols if not s.startswith("_")]
     )
 
@@ -414,8 +452,6 @@ def _resolve_type(cats, files, new_symbols, gone_symbols, added_files):
         return "feat", False           # new files + new API, nothing removed
     if new_symbols and not gone_symbols:
         return "feat", False
-    if gone_symbols and not new_symbols and len(new_symbols) == 0:
-        return "fix", False            # only removals/edits, no new surface
     return "fix", False                # conservative default for edits-in-place
 
 
@@ -519,7 +555,14 @@ def call_gemma(prompt: str, model: str, retries: int = 1) -> str:
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 768},
+        "options": {
+            "temperature": 0.1,   # low → deterministic, structured output
+            "top_p": 0.9,
+            "top_k": 40,
+            "repeat_penalty": 1.1,
+            "seed": 42,           # fixed seed → reproducible runs for the same diff
+            "num_predict": 768,
+        },
     }).encode()
 
     last_err = ""
@@ -602,6 +645,69 @@ def parse_commit_type(message: str) -> str | None:
     return None
 
 
+def _shorten_summary(summary: str, max_len: int) -> str:
+    """Trim a summary to max_len chars on a word boundary, no trailing period."""
+    summary = summary.strip().rstrip(".").strip()
+    if len(summary) <= max_len:
+        return summary
+    cut = summary[:max_len]
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")]
+    return cut.rstrip(",;: ").rstrip()
+
+
+def enforce_commit_format(message: str, analysis: "DiffAnalysis") -> str:
+    """Guarantee a spec-compliant Conventional Commit header.
+
+    The model usually gets this right, but small models drift: wrong/missing
+    type, capitalised type, a scope that isn't real, an over-long header, a
+    trailing period. We repair the *header* deterministically and keep the
+    model's body verbatim — so the output is always valid no matter what.
+    """
+    HEADER_MAX = 72
+    lines = message.splitlines()
+
+    # locate the model's header line (first line that parses as one)
+    idx = next((i for i, l in enumerate(lines) if _HEADER_RE.match(l.strip())), None)
+
+    if idx is None:
+        # no usable header — synthesise one from the analysis + first prose line
+        ctype = analysis.type_guess
+        scope = analysis.scopes[0] if analysis.scopes else ""
+        body_first = next((l.strip() for l in lines if l.strip()), "")
+        # drop a stray leading "Type:" the model may have emitted in prose
+        body_first = re.sub(r"^[A-Za-z]+:\s*", "", body_first)
+        summary = _shorten_summary(body_first or f"update {scope or 'code'}",
+                                   HEADER_MAX - len(ctype) - len(scope) - 4)
+        header = f"{ctype}({scope}): {summary}" if scope else f"{ctype}: {summary}"
+        return header
+
+    m = _HEADER_RE.match(lines[idx].strip())
+    ctype, scope, bang, summary = m.group(1), m.group(2), m.group(3), m.group(4)
+
+    # 1. type: lowercase; if invalid, fall back to the deterministic guess
+    ctype = ctype.lower()
+    if ctype not in VALID_TYPES:
+        ctype = analysis.type_guess
+
+    # 2. scope: lowercase, no spaces; accept the model's scope, else best candidate
+    if scope:
+        scope = re.sub(r"\s+", "", scope.lower())
+    elif analysis.scopes:
+        scope = analysis.scopes[0]
+
+    # 3. breaking marker: honour the analyzer if it detected a break
+    bang = "!" if (bang or analysis.breaking) else ""
+
+    # 4. summary: no trailing period, fit the whole header under HEADER_MAX
+    prefix = f"{ctype}({scope}){bang}: " if scope else f"{ctype}{bang}: "
+    summary = _shorten_summary(summary, HEADER_MAX - len(prefix))
+    header = prefix + summary
+
+    lines[idx] = header
+    return "\n".join(lines).strip()
+
+
 def generate(analysis: DiffAnalysis, model: str, today: str) -> tuple[str, str]:
     digest = build_digest(analysis)
     scopes = ", ".join(analysis.scopes) or "(infer from paths)"
@@ -614,6 +720,9 @@ def generate(analysis: DiffAnalysis, model: str, today: str) -> tuple[str, str]:
     if not commit:  # total model failure → deterministic fallback header
         scope = analysis.scopes[0] if analysis.scopes else "core"
         commit = f"{analysis.type_guess}({scope}): update {scope}"
+
+    # deterministic repair: guarantee a spec-compliant header no matter what
+    commit = enforce_commit_format(commit, analysis)
 
     # single source of truth: the type that actually shipped in the header
     resolved = parse_commit_type(commit) or analysis.type_guess
@@ -691,7 +800,7 @@ def print_results(commit_msg, changelog, analysis: DiffAnalysis, use_json: bool)
 def save_output(commit_msg, changelog, analysis, out_path: Path):
     insights = "\n".join(f"- {i}" for i in analysis.insights)
     content = textwrap.dedent(f"""\
-        <!-- Generated by git_to_doc.py -->
+        <!-- Generated by git_to_doc_v2.py -->
 
         ## Structural Insights
 
@@ -732,10 +841,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              python git_to_doc.py changes.diff
-              python git_to_doc.py pr_42.txt --model gemma3:1b
-              python git_to_doc.py changes.diff --output entry.md
-              python git_to_doc.py changes.diff --json
+              python git_to_doc_v2.py changes.diff
+              python git_to_doc_v2.py pr_42.txt --model gemma3:1b
+              python git_to_doc_v2.py changes.diff --output entry.md
+              python git_to_doc_v2.py changes.diff --json
         """),
     )
     parser.add_argument("diff_file", type=Path, help="Path to .diff or .txt file")
