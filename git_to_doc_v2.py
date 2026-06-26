@@ -1056,6 +1056,7 @@ def main():
               python git_to_doc_v2.py changes.diff --output entry.md
               python git_to_doc_v2.py changes.diff --json
               python git_to_doc_v2.py changes.diff --ai-changelog
+              python git_to_doc_v2.py changes.diff --chart changes.png
         """),
     )
     parser.add_argument("diff_file", type=Path, help="Path to .diff or .txt file")
@@ -1068,6 +1069,9 @@ def main():
     parser.add_argument("--ai-changelog", action="store_true",
                         help="Let Gemma write the changelog prose (default: "
                              "deterministic, fully grounded changelog)")
+    parser.add_argument("--chart", type=Path, default=None,
+                        help="Also render a PNG of the change structure "
+                             "(requires matplotlib)")
     args = parser.parse_args()
 
     raw = load_diff(args.diff_file)
@@ -1088,6 +1092,13 @@ def main():
     print_results(commit_msg, changelog, analysis, args.json)
     if args.output:
         save_output(commit_msg, changelog, analysis, args.output)
+    if args.chart:
+        try:
+            from change_chart import render_change_chart
+            render_change_chart(analysis, args.chart, title=args.diff_file.name)
+            print(f"✅  Saved chart to {args.chart}", file=sys.stderr)
+        except ImportError:
+            pass  # change_chart already explained how to install matplotlib
 
 
 if __name__ == "__main__":
