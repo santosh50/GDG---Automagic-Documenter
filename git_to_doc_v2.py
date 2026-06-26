@@ -574,7 +574,7 @@ def call_gemma(prompt: str, model: str, retries: int = 1) -> str:
             "top_k": 40,
             "repeat_penalty": 1.1,
             "seed": 42,           # fixed seed → reproducible runs for the same diff
-            "num_predict": 768,
+            "num_predict": 1024,  # headroom so grouped output never truncates mid-sentence
         },
     }).encode()
 
@@ -635,8 +635,8 @@ FORMAT RULES:
 - Use this type unless the digest clearly contradicts it: {type_hint}
 - Scope: pick the candidate covering the MOST changed files: {scopes}. If the
   change spans many modules, use the broadest one or omit the scope entirely.
-- After the header, ONE blank line, then 2-4 sentences on WHAT changed and WHY,
-  grounded entirely in the digest.
+- After the header, ONE blank line, then 2-3 short COMPLETE sentences on WHAT
+  changed and WHY, grounded entirely in the digest. Finish every sentence.
 - Output ONLY the commit message. No code fences, no preamble.
 
 Example of GOOD grounding: if the digest shows 19 source files modified with no
@@ -664,11 +664,22 @@ GROUNDING RULES (most important):
 
 FORMAT RULES:
 - First line exactly: ### [Unreleased] — {today}
-- Then bullet lists under ONLY the subsections that have real content. NEVER
-  output an empty section header (no bare "#### Removed" / "#### Security").
+- Use #### section headers. Put bullets under ONLY the sections that have real
+  content. NEVER output an empty section header (no bare "#### Security").
 - Map intent honestly: feat->Added, fix->Fixed, refactor/perf->Changed, removals->Removed.
+- HARD LIMIT: at most 6 bullets total for the whole entry. Group aggressively —
+  collapse many files in the same category into ONE bullet with a count.
 - Each bullet: present tense, plain English, <=100 chars.
 - Output ONLY the Markdown. No code fences, no preamble.
+
+Worked example — for a digest of "19 source modified, 4 added, 3 build, 1 ci":
+### [Unreleased] — 2025-01-01
+#### Added
+- Add 4 files including py.typed and typing.py
+#### Changed
+- Update 19 source modules
+- Update build config (setup.cfg, MANIFEST.in) and CI workflow
+(Note: 6 bullets max, grouped by category, no per-file lines, no guessed verbs.)
 
 {digest}
 """
