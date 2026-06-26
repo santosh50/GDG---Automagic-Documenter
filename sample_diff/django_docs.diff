@@ -1,0 +1,453 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index e3703f586683..8aa6871675cc 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -758,6 +758,9 @@ def urls(self):
+     @property
+     def media(self):
+         extra = "" if settings.DEBUG else ".min"
++
++        css = {"screen": ("admin/css/sidebar.css",)}
++
+         js = [
+             "vendor/jquery/jquery%s.js" % extra,
+             "jquery.init.js",
+@@ -767,8 +770,12 @@ def media(self):
+             "urlify.js",
+             "prepopulate.js",
+             "vendor/xregexp/xregexp%s.js" % extra,
++            "nav_sidebar.js",
+         ]
+-        return forms.Media(js=["admin/js/%s" % url for url in js])
++        return forms.Media(
++            js=["admin/js/%s" % url for url in js],
++            css=css,
++        )
+ 
+     def get_model_perms(self, request):
+         """
+diff --git a/django/contrib/admin/static/admin/css/changelists.css b/django/contrib/admin/static/admin/css/changelists.css
+index 72229082c4e3..85205a04c01d 100644
+--- a/django/contrib/admin/static/admin/css/changelists.css
++++ b/django/contrib/admin/static/admin/css/changelists.css
+@@ -1,5 +1,10 @@
+ /* CHANGELISTS */
+ 
++#content-start {
++    /* prevent horizontal scrollbar on small screens with sidebars */
++    overflow-x: auto;
++}
++
+ #changelist {
+     display: flex;
+     align-items: flex-start;
+@@ -132,11 +137,10 @@
+ /* FILTER COLUMN */
+ 
+ #changelist-filter {
+-    flex: 0 0 240px;
+     order: 1;
+     background: var(--darkened-bg);
+     border-left: none;
+-    margin: 0 0 0 30px;
++    margin: 0;
+ }
+ 
+ @media (forced-colors: active) {
+diff --git a/django/contrib/admin/static/admin/css/responsive.css b/django/contrib/admin/static/admin/css/responsive.css
+index b9553415d71a..eb7ac750c878 100644
+--- a/django/contrib/admin/static/admin/css/responsive.css
++++ b/django/contrib/admin/static/admin/css/responsive.css
+@@ -164,6 +164,11 @@ input[type="submit"], button {
+         border-top-color: var(--hairline-color); /* XXX Is this used at all? */
+     }
+ 
++    .change-list .filtered {
++        /* dont force min-height for mobile, filter is shown below */
++        min-height: auto;
++    }
++
+     #changelist .results + .paginator {
+         border-top: none;
+     }
+@@ -451,6 +456,10 @@ input[type="submit"], button {
+ @media (max-width: 767px) {
+     /* Layout */
+ 
++    #container > .main {
++        flex-wrap: wrap;
++    }
++
+     #header, #content, #footer {
+         padding: 15px;
+     }
+@@ -463,6 +472,10 @@ input[type="submit"], button {
+         padding: 10px 15px;
+     }
+ 
++    #content-start {
++        overflow-x: inherit;
++    }
++
+     /* Dashboard */
+ 
+     .colMS, .colSM {
+@@ -494,8 +507,11 @@ input[type="submit"], button {
+         padding: 10px;
+     }
+ 
+-    #changelist-filter {
+-        margin-left: 0;
++    /* navigation sidebar, sidebars toggle buttons */
++    #nav-sidebar,
++    #toggle-nav-sidebar,
++    #toggle-filter-sidebar {
++        display: none;
+     }
+ 
+     #changelist .actions label {
+@@ -512,9 +528,9 @@ input[type="submit"], button {
+     }
+ 
+     #changelist-filter {
+-        position: static;
+-        width: auto;
+-        margin-top: 30px;
++        display: block;
++        margin-left: 0;
++        flex: 1 1 200px;
+     }
+ 
+     .object-tools {
+diff --git a/django/contrib/admin/static/admin/css/nav_sidebar.css b/django/contrib/admin/static/admin/css/sidebar.css
+similarity index 72%
+rename from django/contrib/admin/static/admin/css/nav_sidebar.css
+rename to django/contrib/admin/static/admin/css/sidebar.css
+index 7eb0de97ab27..cfd520e9778a 100644
+--- a/django/contrib/admin/static/admin/css/nav_sidebar.css
++++ b/django/contrib/admin/static/admin/css/sidebar.css
+@@ -4,16 +4,14 @@
+     max-height: 100vh;
+ }
+ 
+-.toggle-nav-sidebar {
++.toggle-sidebar {
+     z-index: 20;
+-    left: 0;
+     display: flex;
+     align-items: center;
+     justify-content: center;
+     flex: 0 0 23px;
+     width: 23px;
+     border: 0;
+-    border-right: 1px solid var(--hairline-color);
+     background-color: var(--body-bg);
+     cursor: pointer;
+     font-size: 1.25rem;
+@@ -21,13 +19,29 @@
+     padding: 0;
+ }
+ 
+-[dir="rtl"] .toggle-nav-sidebar {
++#toggle-nav-sidebar {
++    left: 0;
++    border-right: 1px solid var(--hairline-color);
++}
++
++#toggle-filter-sidebar {
++    right: 0;
++    border-left: 1px solid var(--hairline-color);
++    order: 2;
++}
++
++[dir="rtl"] #toggle-nav-sidebar {
+     border-left: 1px solid var(--hairline-color);
+     border-right: 0;
+ }
+ 
+-.toggle-nav-sidebar:hover,
+-.toggle-nav-sidebar:focus {
++[dir="rtl"] #toggle-filter-sidebar {
++    border-left: 0;
++    border-right:  1px solid var(--hairline-color);
++}
++
++.toggle-sidebar:hover,
++.toggle-sidebar:focus {
+     background-color: var(--darkened-bg);
+ }
+ 
+@@ -51,24 +65,38 @@
+     margin-right: -276px;
+ }
+ 
+-.toggle-nav-sidebar::before {
++#toggle-nav-sidebar::before,
++.main.changelist-filter-expanded #toggle-filter-sidebar::before {
++    /* arrow right */
+     content: '\00BB';
+ }
+ 
+-.main.shifted .toggle-nav-sidebar::before {
++#toggle-filter-sidebar::before,
++.main.nav-sidebar-expanded #toggle-nav-sidebar::before {
++    /* arrow left */
+     content: '\00AB';
+ }
+ 
+-.main > #nav-sidebar {
++#changelist-filter {
++    display: none;
++    flex: 0 1 270px;
++}
++
++#nav-sidebar {
+     visibility: hidden;
+ }
+ 
+-.main.shifted > #nav-sidebar {
++.main.changelist-filter-expanded > #changelist-filter {
++    display: block;
++}
++
++.main.nav-sidebar-expanded > #nav-sidebar {
+     margin-left: 0;
+     visibility: visible;
++    max-width: calc(100% - 299px);
+ }
+ 
+-[dir="rtl"] .main.shifted > #nav-sidebar {
++[dir="rtl"] .main.nav-sidebar-expanded > #nav-sidebar {
+     margin-right: 0;
+ }
+ 
+@@ -108,25 +136,6 @@
+     }
+ }
+ 
+-.main > #nav-sidebar + .content {
+-    max-width: calc(100% - 23px);
+-}
+-
+-.main.shifted > #nav-sidebar + .content {
+-    max-width: calc(100% - 299px);
+-}
+-
+-@media (max-width: 767px) {
+-    #nav-sidebar, #toggle-nav-sidebar {
+-        display: none;
+-    }
+-
+-    .main > #nav-sidebar + .content,
+-    .main.shifted > #nav-sidebar + .content {
+-        max-width: 100%;
+-    }
+-}
+-
+ #nav-filter {
+     width: 100%;
+     box-sizing: border-box;
+diff --git a/django/contrib/admin/static/admin/js/nav_sidebar.js b/django/contrib/admin/static/admin/js/nav_sidebar.js
+index 7e735db15cf3..7c09935a4dad 100644
+--- a/django/contrib/admin/static/admin/js/nav_sidebar.js
++++ b/django/contrib/admin/static/admin/js/nav_sidebar.js
+@@ -1,25 +1,25 @@
+ 'use strict';
+ {
+-    const toggleNavSidebar = document.getElementById('toggle-nav-sidebar');
+-    if (toggleNavSidebar !== null) {
+-        const navSidebar = document.getElementById('nav-sidebar');
+-        const main = document.getElementById('main');
+-        let navSidebarIsOpen = localStorage.getItem('django.admin.navSidebarIsOpen');
+-        if (navSidebarIsOpen === null) {
+-            navSidebarIsOpen = 'true';
++    function handleSidebarToggle(toggleElementId, sidebarID, storeProperty) {
++        const toggleNode = document.getElementById(toggleElementId);
++        if (toggleNode === null) {
++            return;
+         }
+-        main.classList.toggle('shifted', navSidebarIsOpen === 'true');
+-        navSidebar.setAttribute('aria-expanded', navSidebarIsOpen);
+ 
+-        toggleNavSidebar.addEventListener('click', function() {
+-            if (navSidebarIsOpen === 'true') {
+-                navSidebarIsOpen = 'false';
+-            } else {
+-                navSidebarIsOpen = 'true';
+-            }
+-            localStorage.setItem('django.admin.navSidebarIsOpen', navSidebarIsOpen);
+-            main.classList.toggle('shifted');
+-            navSidebar.setAttribute('aria-expanded', navSidebarIsOpen);
++        const toggleClass = `${sidebarID}-expanded`;
++        let sidebarIsOpen = localStorage.getItem(storeProperty) !== 'false';
++
++        const mainNode = document.getElementById('main');
++        mainNode.classList.toggle(toggleClass, sidebarIsOpen);
++
++        const sidebarNode = document.getElementById(sidebarID);
++        sidebarNode.setAttribute('aria-expanded', sidebarIsOpen);
++
++        toggleNode.addEventListener('click', function() {
++            sidebarIsOpen = !sidebarIsOpen;
++            localStorage.setItem(storeProperty, sidebarIsOpen);
++            mainNode.classList.toggle(toggleClass);
++            sidebarNode.setAttribute('aria-expanded', sidebarIsOpen);
+         });
+     }
+ 
+@@ -75,5 +75,22 @@
+         }
+     }
+     window.initSidebarQuickFilter = initSidebarQuickFilter;
+-    initSidebarQuickFilter();
++
++    window.addEventListener('load', function() {
++        initSidebarQuickFilter();
++
++        // secondary sidebar (filter)
++        handleSidebarToggle(
++            'toggle-filter-sidebar',
++            'changelist-filter',
++            'django.admin.filterSidebarIsOpen'
++        );
++
++        // leading sidebar (nav)
++        handleSidebarToggle(
++            'toggle-nav-sidebar',
++            'nav-sidebar',
++            'django.admin.navSidebarIsOpen'
++        );
++    });
+ }
+diff --git a/django/contrib/admin/templates/admin/base.html b/django/contrib/admin/templates/admin/base.html
+index 1ca50e508d1d..5bbebb2b27db 100644
+--- a/django/contrib/admin/templates/admin/base.html
++++ b/django/contrib/admin/templates/admin/base.html
+@@ -8,10 +8,6 @@
+   <link rel="stylesheet" href="{% static "admin/css/dark_mode.css" %}">
+   <script src="{% static "admin/js/theme.js" %}"></script>
+ {% endblock %}
+-{% if not is_popup and is_nav_sidebar_enabled %}
+-  <link rel="stylesheet" href="{% static "admin/css/nav_sidebar.css" %}">
+-  <script src="{% static 'admin/js/nav_sidebar.js' %}" defer></script>
+-{% endif %}
+ {% block extrastyle %}{% endblock %}
+ {% if LANGUAGE_BIDI %}<link rel="stylesheet" href="{% block stylesheet_rtl %}{% static "admin/css/rtl.css" %}{% endblock %}">{% endif %}
+ {% block extrahead %}{% endblock %}
+@@ -110,6 +106,7 @@
+         <!-- END Content -->
+         {% block footer %}<div id="footer"></div>{% endblock %}
+       </main>
++      {% block filters %}{% endblock %}
+     </div>
+ </div>
+ <!-- END Container -->
+diff --git a/django/contrib/admin/templates/admin/change_list.html b/django/contrib/admin/templates/admin/change_list.html
+index 310872b0150b..829de57b7027 100644
+--- a/django/contrib/admin/templates/admin/change_list.html
++++ b/django/contrib/admin/templates/admin/change_list.html
+@@ -21,7 +21,9 @@
+ {% block extrahead %}
+ {{ block.super }}
+ {{ media.js }}
+-<script src="{% static 'admin/js/filters.js' %}" defer></script>
++{% if cl.has_filters %}
++  <script src="{% static 'admin/js/filters.js' %}" defer></script>
++{% endif %}
+ {% endblock %}
+ 
+ {% block bodyclass %}{{ block.super }} app-{{ opts.app_label }} model-{{ opts.model_name }} change-list{% endblock %}
+@@ -71,23 +73,25 @@
+         {% block pagination %}{% pagination cl %}{% endblock %}
+         </form>
+       </div>
+-      {% block filters %}
+-        {% if cl.has_filters %}
+-          <nav id="changelist-filter" aria-labelledby="changelist-filter-header">
+-            <h2 id="changelist-filter-header">{% translate 'Filter' %}</h2>
+-            {% if cl.is_facets_optional or cl.has_active_filters %}<div id="changelist-filter-extra-actions">
+-              {% if cl.is_facets_optional %}<h3>
+-                {% if cl.add_facets %}<a href="{{ cl.remove_facet_link }}" class="hidelink">{% translate "Hide counts" %}</a>
+-                {% else %}<a href="{{ cl.add_facet_link }}" class="viewlink">{% translate "Show counts" %}</a>{% endif %}
+-              </h3>{% endif %}
+-              {% if cl.has_active_filters %}<h3>
+-                <a href="{{ cl.clear_all_filters_qs }}">&#10006; {% translate "Clear all filters" %}</a>
+-              </h3>{% endif %}
+-            </div>{% endif %}
+-            {% for spec in cl.filter_specs %}{% admin_list_filter cl spec %}{% endfor %}
+-          </nav>
+-        {% endif %}
+-      {% endblock %}
+     </div>
+   </div>
+ {% endblock %}
++
++{% block filters %}
++  {% if cl.has_filters %}
++    <button class="sticky toggle-sidebar sidebar-filter" id="toggle-filter-sidebar" aria-label="{% translate 'Toggle filters' %}"></button>
++    <nav id="changelist-filter" class="module sticky" aria-labelledby="changelist-filter-header">
++      <h2 id="changelist-filter-header">{% translate 'Filter' %}</h2>
++      {% if cl.is_facets_optional or cl.has_active_filters %}<div id="changelist-filter-extra-actions">
++        {% if cl.is_facets_optional %}<h3>
++          {% if cl.add_facets %}<a href="{{ cl.remove_facet_link }}" class="hidelink">{% translate "Hide counts" %}</a>
++          {% else %}<a href="{{ cl.add_facet_link }}" class="viewlink">{% translate "Show counts" %}</a>{% endif %}
++        </h3>{% endif %}
++        {% if cl.has_active_filters %}<h3>
++          <a href="{{ cl.clear_all_filters_qs }}">&#10006; {% translate "Clear all filters" %}</a>
++        </h3>{% endif %}
++      </div>{% endif %}
++      {% for spec in cl.filter_specs %}{% admin_list_filter cl spec %}{% endfor %}
++    </nav>
++  {% endif %}
++{% endblock %}
+diff --git a/django/contrib/admin/templates/admin/nav_sidebar.html b/django/contrib/admin/templates/admin/nav_sidebar.html
+index a413e23754ca..85ee4abd8228 100644
+--- a/django/contrib/admin/templates/admin/nav_sidebar.html
++++ b/django/contrib/admin/templates/admin/nav_sidebar.html
+@@ -1,5 +1,5 @@
+ {% load i18n %}
+-<button class="sticky toggle-nav-sidebar" id="toggle-nav-sidebar" aria-label="{% translate 'Toggle navigation' %}"></button>
++<button class="sticky toggle-sidebar" id="toggle-nav-sidebar" aria-label="{% translate 'Toggle navigation' %}"></button>
+ <nav class="sticky" id="nav-sidebar" aria-label="{% translate 'Sidebar' %}">
+   <input type="search" id="nav-filter"
+          placeholder="{% translate 'Start typing to filter…' %}"
+diff --git a/tests/admin_views/tests.py b/tests/admin_views/tests.py
+index cb61c889414b..9c144aa6970f 100644
+--- a/tests/admin_views/tests.py
++++ b/tests/admin_views/tests.py
+@@ -873,7 +873,10 @@ def test_limited_filter(self):
+         response = self.client.get(reverse("admin:admin_views_thing_changelist"))
+         self.assertContains(
+             response,
+-            '<nav id="changelist-filter" aria-labelledby="changelist-filter-header">',
++            (
++                '<nav id="changelist-filter" class="module sticky" '
++                'aria-labelledby="changelist-filter-header">'
++            ),
+             msg_prefix="Expected filter not found in changelist view",
+         )
+         self.assertNotContains(
+@@ -928,7 +931,10 @@ def test_relation_spanning_filters(self):
+         response = self.client.get(changelist_url)
+         self.assertContains(
+             response,
+-            '<nav id="changelist-filter" aria-labelledby="changelist-filter-header">',
++            (
++                '<nav id="changelist-filter" class="module sticky" '
++                'aria-labelledby="changelist-filter-header">'
++            ),
+         )
+         filters = {
+             "chap__id__exact": {
+@@ -1068,7 +1074,10 @@ def test_named_group_field_choices_filter(self):
+         )
+         self.assertContains(
+             response,
+-            '<nav id="changelist-filter" aria-labelledby="changelist-filter-header">',
++            (
++                '<nav id="changelist-filter" class="module sticky" '
++                'aria-labelledby="changelist-filter-header">'
++            ),
+         )
+         self.assertContains(
+             response,

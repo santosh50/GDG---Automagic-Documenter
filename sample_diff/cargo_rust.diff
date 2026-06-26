@@ -1,0 +1,140 @@
+diff --git a/credential/cargo-credential/src/error.rs b/credential/cargo-credential/src/error.rs
+index 2ebaf99777b..8c5fe19e5ff 100644
+--- a/credential/cargo-credential/src/error.rs
++++ b/credential/cargo-credential/src/error.rs
+@@ -42,9 +42,9 @@ pub enum Error {
+ }
+ 
+ impl From<String> for Error {
+-    fn from(err: String) -> Self {
++    fn from(message: String) -> Self {
+         Box::new(StringTypedError {
+-            message: err.to_string(),
++            message,
+             source: None,
+         })
+         .into()
+diff --git a/src/cargo/core/compiler/custom_build.rs b/src/cargo/core/compiler/custom_build.rs
+index ca6c29c3d1e..f862852169b 100644
+--- a/src/cargo/core/compiler/custom_build.rs
++++ b/src/cargo/core/compiler/custom_build.rs
+@@ -281,7 +281,7 @@ fn build_work(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Job> {
+         .env("NUM_JOBS", &bcx.jobs().to_string())
+         .env("TARGET", bcx.target_data.short_name(&unit.kind))
+         .env("DEBUG", debug.to_string())
+-        .env("OPT_LEVEL", &unit.profile.opt_level.to_string())
++        .env("OPT_LEVEL", &unit.profile.opt_level)
+         .env(
+             "PROFILE",
+             match unit.profile.root {
+diff --git a/src/cargo/core/compiler/mod.rs b/src/cargo/core/compiler/mod.rs
+index 10bbb03027a..9bc80583ce6 100644
+--- a/src/cargo/core/compiler/mod.rs
++++ b/src/cargo/core/compiler/mod.rs
+@@ -252,7 +252,7 @@ fn rustc(cx: &mut Context<'_, '_>, unit: &Unit, exec: &Arc<dyn Executor>) -> Car
+     let mut rustc = prepare_rustc(cx, unit)?;
+     let build_plan = cx.bcx.build_config.build_plan;
+ 
+-    let name = unit.pkg.name().to_string();
++    let name = unit.pkg.name();
+     let buildkey = unit.buildkey();
+ 
+     let outputs = cx.outputs(unit)?;
+@@ -785,7 +785,7 @@ fn rustdoc(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Work> {
+     paths::create_dir_all(&doc_dir)?;
+ 
+     let target_desc = unit.target.description_named();
+-    let name = unit.pkg.name().to_string();
++    let name = unit.pkg.name();
+     let build_script_outputs = Arc::clone(&cx.build_script_outputs);
+     let package_id = unit.pkg.package_id();
+     let manifest_path = PathBuf::from(unit.pkg.manifest_path());
+diff --git a/src/cargo/core/package.rs b/src/cargo/core/package.rs
+index 33061aa2004..aa673e937ce 100644
+--- a/src/cargo/core/package.rs
++++ b/src/cargo/core/package.rs
+@@ -338,7 +338,7 @@ pub struct Downloads<'a, 'cfg> {
+     /// Total bytes for all successfully downloaded packages.
+     downloaded_bytes: u64,
+     /// Size (in bytes) and package name of the largest downloaded package.
+-    largest: (u64, String),
++    largest: (u64, InternedString),
+     /// Time when downloading started.
+     start: Instant,
+     /// Indicates *all* downloads were successful.
+@@ -459,7 +459,7 @@ impl<'cfg> PackageSet<'cfg> {
+             ))),
+             downloads_finished: 0,
+             downloaded_bytes: 0,
+-            largest: (0, String::new()),
++            largest: (0, InternedString::new("")),
+             success: false,
+             updated_at: Cell::new(Instant::now()),
+             timeout,
+@@ -891,7 +891,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
+         self.downloads_finished += 1;
+         self.downloaded_bytes += dl.total.get();
+         if dl.total.get() > self.largest.0 {
+-            self.largest = (dl.total.get(), dl.id.name().to_string());
++            self.largest = (dl.total.get(), dl.id.name());
+         }
+ 
+         // We're about to synchronously extract the crate below. While we're
+diff --git a/src/cargo/core/resolver/dep_cache.rs b/src/cargo/core/resolver/dep_cache.rs
+index e0a5ea7d763..72757e40911 100644
+--- a/src/cargo/core/resolver/dep_cache.rs
++++ b/src/cargo/core/resolver/dep_cache.rs
+@@ -531,10 +531,9 @@ impl RequirementError {
+                             summary.package_id(),
+                             feat
+                         )),
+-                        Some(p) => ActivateError::Conflict(
+-                            p,
+-                            ConflictReason::MissingFeatures(feat.to_string()),
+-                        ),
++                        Some(p) => {
++                            ActivateError::Conflict(p, ConflictReason::MissingFeatures(feat))
++                        }
+                     };
+                 }
+                 if deps.iter().any(|dep| dep.is_optional()) {
+@@ -575,10 +574,9 @@ impl RequirementError {
+                     )),
+                     // This code path currently isn't used, since `foo/bar`
+                     // and `dep:` syntax is not allowed in a dependency.
+-                    Some(p) => ActivateError::Conflict(
+-                        p,
+-                        ConflictReason::MissingFeatures(dep_name.to_string()),
+-                    ),
++                    Some(p) => {
++                        ActivateError::Conflict(p, ConflictReason::MissingFeatures(dep_name))
++                    }
+                 }
+             }
+             RequirementError::Cycle(feat) => ActivateError::Fatal(anyhow::format_err!(
+diff --git a/src/cargo/core/resolver/types.rs b/src/cargo/core/resolver/types.rs
+index 40bdb6c211d..9ef78090ed2 100644
+--- a/src/cargo/core/resolver/types.rs
++++ b/src/cargo/core/resolver/types.rs
+@@ -285,7 +285,7 @@ pub enum ConflictReason {
+     /// A dependency listed features that weren't actually available on the
+     /// candidate. For example we tried to activate feature `foo` but the
+     /// candidate we're activating didn't actually have the feature `foo`.
+-    MissingFeatures(String),
++    MissingFeatures(InternedString),
+ 
+     /// A dependency listed a feature that ended up being a required dependency.
+     /// For example we tried to activate feature `foo` but the
+diff --git a/src/cargo/util/toml/mod.rs b/src/cargo/util/toml/mod.rs
+index 1c73341f987..c263fc305b3 100644
+--- a/src/cargo/util/toml/mod.rs
++++ b/src/cargo/util/toml/mod.rs
+@@ -2326,7 +2326,7 @@ impl TomlManifest {
+             let mut names_sources = BTreeMap::new();
+             for dep in &deps {
+                 let name = dep.name_in_toml();
+-                let prev = names_sources.insert(name.to_string(), dep.source_id());
++                let prev = names_sources.insert(name, dep.source_id());
+                 if prev.is_some() && prev != Some(dep.source_id()) {
+                     bail!(
+                         "Dependency '{}' has different source paths depending on the build \
