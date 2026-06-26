@@ -1,47 +1,74 @@
-# git_to_doc
+# Automagic Documenter (`git_to_doc`)
 
-> Turn a raw `git diff` into a Conventional Commit message and a Markdown changelog entry — powered by a local Gemma model, no API keys, no cloud.
+> Turn a raw `git diff` into a Conventional Commit message **and** a Markdown changelog entry — grounded by a deterministic analyzer and written by a local Google Gemma model. No API keys, no cloud, your code never leaves your machine.
 
 ```bash
 python git_to_doc.py changes.diff
 ```
 
 ```
+⊙ STRUCTURAL INSIGHTS
+────────────────────────────────────────────────────────────
+  • 9 file(s) touched across source, test (+146 / -83).
+  • New public API surface: handleSidebarToggle.
+  • Deterministic type: feat (model will confirm).
+
 ① CONVENTIONAL COMMIT
 ────────────────────────────────────────────────────────────
-feat(auth): add scope-based access control to token validation
+feat(admin): introduce navigation sidebar and related CSS/JS
 
-Extend TokenManager.generate() to accept an optional list of OAuth-style
-scopes stored alongside each token. validate() now accepts a required_scope
-parameter and returns None when the token lacks the requested permission.
-Also fixes naive datetime.utcnow() calls to use timezone-aware equivalents.
+This change introduces a new navigation sidebar within the Django admin
+interface. The sidebar is implemented with updated JavaScript and CSS,
+enhancing access to different sections of the admin panel. Changes also
+include modifications to options.py and updates to base and changelist
+templates, plus responsive CSS fixes to prevent horizontal scrolling.
 
 ② README CHANGELOG SNIPPET
 ────────────────────────────────────────────────────────────
-### [Unreleased] — 2025-07-12
+### Unreleased
 
-#### Added
-- Scope-based access control: tokens now carry an optional list of permission scopes
-- `require_auth` middleware decorator accepts a `scope` argument for route-level enforcement
-
-#### Changed
-- `TokenManager.generate()` now returns a metadata dict (`token`, `expires_at`, `scopes`)
-- Token generation uses a cryptographic nonce via `secrets.token_hex` for replay protection
-
-#### Fixed
-- `middleware.require_auth` now logs auth failures with client IP for auditability
+#### Added or Changed
+- Added a `sidebar.css` stylesheet for the navigation sidebar
+- Added a JavaScript file to handle the sidebar toggle functionality
+- Modified `options.py` to include the new CSS and JS references
+- Updated `base.html` to conditionally load the sidebar assets
+- Updated tests in `tests/admin_views/tests.py` for the new sidebar
 ```
 
 ---
 
 ## What it actually does
 
-Developers write terrible commit messages. They skip changelog updates. `git_to_doc` fixes both in one command by routing your diff through a local [Google Gemma](https://ai.google.dev/gemma) model and returning two structured, ready-to-paste outputs:
+Developers write terrible commit messages and skip changelog updates. `git_to_doc` fixes both in one command — but unlike a naive "throw the diff at an LLM" tool, it never lets the model see the raw diff cold.
 
-- A **Conventional Commit message** (`feat(scope): summary` + body) following the [Conventional Commits](https://www.conventionalcommits.org/) spec
-- A **Markdown changelog snippet** in [Keep a Changelog](https://keepachangelog.com/) format, with `Added / Changed / Fixed / Removed` subsections
+A **deterministic analyzer** parses the diff's *structure* first — files, change kinds, languages, added/removed symbols, dependency changes, breaking-change signals — resolves everything it can on its own, and hands Gemma a clean, fact-dense **structured digest**. This anchoring is what keeps small local models from hallucinating features that aren't there.
 
-Everything runs locally via [Ollama](https://ollama.com). Your code never leaves your machine.
+You get three outputs:
+
+- **Structural insights** — a deterministic summary of what changed (files, categories, new/removed API, breaking signals)
+- A **Conventional Commit message** (`feat(scope): summary` + body) following the [Conventional Commits](https://www.conventionalcommits.org/) spec — written by Gemma, then **repaired by a deterministic validator** so the header is *always* spec-compliant
+- A **Markdown changelog snippet** in the [Best-README-Template](https://github.com/othneildrew/Best-README-Template) style (`Added or Changed` / `Removed`), with a fully grounded deterministic fallback if the model under-produces
+
+Optionally, it can also render a **PNG chart** of the change structure (additions vs. deletions by category and by file).
+
+Everything runs locally via [Ollama](https://ollama.com).
+
+---
+
+## How accuracy is enforced
+
+This is the core of the design — accuracy over fluency:
+
+| Stage | Who does it | Why |
+|---|---|---|
+| Parse diff → files, symbols, categories | Deterministic | Facts, not guesses |
+| Classify change type (feat/fix/docs/…) | Deterministic, with a confidence flag | Single-category changes (docs-only, test-only) are resolved without the model |
+| Write commit narrative | Gemma | Human judgement helps here |
+| Repair commit header | Deterministic | Guarantees valid `<type>(<scope>): <summary>`, ≤72 chars, no fabricated `BREAKING CHANGE` footers |
+| Write changelog bullets | Gemma | Descriptive, file-aware prose |
+| Fallback changelog | Deterministic | Zero hallucination, never empty or truncated |
+
+The analyzer is **authoritative** on breaking changes and change type — the model is given a strong prior but its drift is corrected after the fact.
 
 ---
 
@@ -50,7 +77,10 @@ Everything runs locally via [Ollama](https://ollama.com). Your code never leaves
 - Python 3.8+
 - [Ollama](https://ollama.com) running locally
 - A pulled Gemma model (see setup below)
-- `rich` (optional — enables pretty terminal output)
+- `rich` *(optional)* — pretty terminal panels
+- `matplotlib` *(optional)* — only needed for `--chart`
+
+The core tool is **pure standard library** (`urllib`) — no `pip install` required to run it.
 
 ---
 
@@ -68,22 +98,23 @@ curl -fsSL https://ollama.com/install.sh | sh
 **2. Pull a Gemma model**
 
 ```bash
-ollama pull gemma3:4b        # recommended — best speed/quality balance (~2.5 GB)
-ollama pull gemma3:1b        # fastest, lowest memory footprint (~800 MB)
-ollama pull gemma3:12b       # highest quality, requires ~8 GB RAM
+ollama pull gemma3:12b       # default — hallucinates far less (~8 GB RAM)
+ollama pull gemma3:4b        # faster, smaller (~2.5 GB), good balance
+ollama pull gemma3:1b        # fastest, lowest memory (~800 MB) — riskiest accuracy
 ```
 
-**3. Install optional dependency**
+**3. Install optional dependencies**
 
 ```bash
-pip install rich              # optional — enables syntax highlighting and panels
+pip install rich             # prettier terminal output
+pip install matplotlib       # required only for --chart
 ```
 
 **4. Confirm everything works**
 
 ```bash
-ollama serve                  # keep this running in a separate terminal
-python git_to_doc.py sample.diff
+ollama serve                 # keep running in a separate terminal
+python git_to_doc.py sample_diff/django_docs.diff
 ```
 
 ---
@@ -94,13 +125,16 @@ python git_to_doc.py sample.diff
 python git_to_doc.py <diff_file> [options]
 
 positional arguments:
-  diff_file          Path to a .diff or .txt file containing a raw git diff
+  diff_file                  Path to a .diff or .txt file containing a raw git diff
 
 options:
-  --model MODEL      Ollama model name  (default: gemma3:4b)
-  --output FILE      Save output to a Markdown file instead of printing
-  --json             Emit JSON  {commit_message, changelog, stats}  for scripting
-  -h, --help         Show this help message
+  --model MODEL              Ollama model name (default: gemma3:12b)
+  --output FILE              Save full output (insights + commit + changelog) to a .md file
+  --json                     Emit machine-readable JSON for scripting
+  --version LABEL            Version label for the changelog (default: Unreleased; e.g. v1.2.0)
+  --deterministic-changelog  Skip Gemma for the changelog; build it purely from parsed facts
+  --chart FILE.png           Render a PNG of the change structure (requires matplotlib)
+  -h, --help                 Show this help message
 ```
 
 ### Examples
@@ -109,20 +143,26 @@ options:
 # Basic usage — print to terminal
 python git_to_doc.py changes.diff
 
-# Use the lightweight 1B model
-python git_to_doc.py changes.diff --model gemma3:1b
+# Use the lightweight model for speed
+python git_to_doc.py changes.diff --model gemma3:4b
 
-# Save output to a file
+# Tag the changelog entry with a real version
+python git_to_doc.py changes.diff --version v1.2.0
+
+# Save the full report to a file
 python git_to_doc.py changes.diff --output entry.md
+
+# Zero-hallucination changelog built purely from parsed facts
+python git_to_doc.py changes.diff --deterministic-changelog
+
+# Render a visual breakdown of the change
+python git_to_doc.py changes.diff --chart change.png
 
 # Machine-readable JSON — pipe into jq, CI scripts, etc.
 python git_to_doc.py changes.diff --json | jq .commit_message
 
 # Generate a diff on the fly and pass it straight in
-git diff HEAD~1 > /tmp/latest.diff && python git_to_doc.py /tmp/latest.diff
-
-# Staged changes only
-git diff --cached > staged.diff && python git_to_doc.py staged.diff
+git diff HEAD~1 > latest.diff && python git_to_doc.py latest.diff
 ```
 
 ---
@@ -143,6 +183,8 @@ git diff HEAD~1 -- src/auth/token.py > token_change.diff
 git diff main..feature/my-branch > feature.diff
 ```
 
+Sample diffs from real open-source PRs are included in [`sample_diff/`](sample_diff/) to try the tool out immediately.
+
 ---
 
 ## How it works
@@ -151,18 +193,30 @@ git diff main..feature/my-branch > feature.diff
 your_change.diff
       │
       ▼
-  load_diff()       — reads file, validates, truncates at 6,000 chars if needed
+  parse_diff()      — raw unified diff → structured FileChange list
+      │                (kinds, languages, categories, +/- symbols, binaries)
+      ▼
+  analyze()         — deterministic insight engine
+      │                (scopes, dependency changes, type guess, breaking signal)
+      ▼
+  build_digest()    — fact-dense summary + budgeted raw diff (≤ 6,000 chars)
       │
-      ├──► call_gemma(COMMIT_PROMPT)    ──► Ollama API ──► Gemma model
-      │                                                          │
-      └──► call_gemma(CHANGELOG_PROMPT) ──► Ollama API ──► Gemma model
-                  │                               │
-                  ▼                               ▼
-          commit message                  changelog markdown
-                  │                               │
-                  └──────────────┬────────────────┘
-                                 ▼
-                    stdout  /  --output  /  --json
+      ├──► call_gemma(COMMIT_PROMPT)    ──► Ollama ──► Gemma
+      │            │                                     │
+      │            ▼                                     ▼
+      │     enforce_commit_format()  ◄──────── narrative commit message
+      │            │  (deterministic header repair)
+      │            ▼
+      │     spec-compliant commit
+      │
+      └──► call_gemma(CHANGELOG_PROMPT) ──► Ollama ──► Gemma
+                   │                                     │
+                   ▼                                     ▼
+            enforce_changelog()  ◄──────────── changelog bullets
+                   │  (drops empty sections; falls back to
+                   │   render_changelog() if under-produced)
+                   ▼
+        stdout  /  --output  /  --json  /  --chart
 ```
 
 Two separate model calls are made intentionally — one focused prompt per output produces better results than a single combined prompt trying to do both jobs.
@@ -171,11 +225,38 @@ Two separate model calls are made intentionally — one focused prompt per outpu
 
 | Decision | Why |
 |---|---|
-| `temperature: 0.2` | Low randomness gives consistent, structured output every run |
-| Truncate at 6,000 chars | Keeps diffs within Gemma 4B's context window safely |
-| Two prompts, not one | Separation of concerns; each prompt has a single job |
+| Analyzer runs *before* the model | The model gets grounded facts, not a raw diff — kills hallucination |
+| Deterministic header repair | Commit header is *always* valid, no matter what the model emits |
+| Deterministic changelog fallback | Output is never empty, truncated, or malformed |
+| Analyzer is authoritative on breaking changes | Small models love to invent `BREAKING CHANGE:` footers — these get stripped |
+| `temperature: 0.15` + fixed `seed` | Consistent, reproducible output for the same diff |
+| Budget raw diff at 6,000 chars | Drops large hunk *bodies* first while always keeping every file's header skeleton |
 | stdlib only (`urllib`) | Zero required dependencies — works out of the box |
-| `--json` flag | Makes the tool composable with CI pipelines and other scripts |
+| `--json` flag | Composable with CI pipelines and other scripts |
+
+---
+
+## Output to file
+
+`--output entry.md` writes a complete report — structural insights, the commit message in a code block, and the changelog snippet — ready to drop into a PR description or `CHANGELOG.md`.
+
+`--json` emits `{ commit_message, changelog, analysis }`, where `analysis` includes the per-file breakdown, totals, inferred scopes, dependency changes, type guess (with confidence), breaking-change flag, and human-readable insights.
+
+---
+
+## Visualizing a change (`change_chart.py`)
+
+`change_chart.py` renders a PNG showing *where* a change landed: diverging additions/deletions bars grouped **by category** and the **heaviest individual files**. It consumes the same `DiffAnalysis` the main tool produces, so it never re-parses anything.
+
+```bash
+# Via the main tool
+python git_to_doc.py changes.diff --chart change.png
+
+# Standalone
+python change_chart.py changes.diff change.png
+```
+
+Requires `matplotlib` (`pip install matplotlib`).
 
 ---
 
@@ -184,10 +265,12 @@ Two separate model calls are made intentionally — one focused prompt per outpu
 | Error | Fix |
 |---|---|
 | `Cannot reach Ollama at localhost:11434` | Run `ollama serve` in a separate terminal |
-| `model not found` | Run `ollama pull gemma3:4b` |
-| Output is blank or conversational filler | Lower temperature is already set; try `--model gemma3:12b` for better instruction-following |
-| Diff truncated warning | Split your diff into per-feature files; only the first 6,000 chars are sent |
-| No GPU / low RAM | `gemma3:1b` runs fine on CPU — slower but functional |
+| `model not found` | Run `ollama pull gemma3:12b` (or the model you passed to `--model`) |
+| Output is blank or conversational filler | Already mitigated by low temperature + sanitization; try the larger `gemma3:12b` |
+| Changelog looks thin or generic | Use `--deterministic-changelog` for a fully grounded, fact-based version |
+| `bodies of N large file(s) omitted` note | Expected for huge diffs — only the first 6,000 chars of raw bodies are sent; structure is still complete |
+| `--chart requires matplotlib` | `pip install matplotlib` |
+| No GPU / low RAM | `gemma3:1b` or `gemma3:4b` run on CPU — slower, and 1b is less accurate |
 
 ---
 
