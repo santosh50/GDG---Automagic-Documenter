@@ -589,7 +589,7 @@ def call_gemma(prompt: str, model: str, retries: int = 1) -> str:
             "top_k": 40,
             "repeat_penalty": 1.1,
             "seed": 42,           # fixed seed → reproducible runs for the same diff
-            "num_predict": 1024,  # headroom so grouped output never truncates mid-sentence
+            "num_predict": 2048,  # ample headroom for a detailed changelog
         },
     }).encode()
 
@@ -650,10 +650,10 @@ FORMAT RULES:
 - Use this type unless the digest clearly contradicts it: {type_hint}
 - Scope: pick the candidate covering the MOST changed files: {scopes}. If the
   change spans many modules, use the broadest one or omit the scope entirely.
-- After the header, ONE blank line, then 2-3 short COMPLETE sentences on WHAT
-  changed and WHY, grounded entirely in the digest. Finish every sentence.
-- Refer to groups of files collectively ("across 18 modules"). NEVER enumerate
-  individual file or module names — that wastes space and reads poorly.
+- After the header, ONE blank line, then 3-4 COMPLETE sentences on WHAT changed
+  and WHY, grounded entirely in the digest. Finish every sentence.
+- You may name a few key files or subsystems, but refer to large groups
+  collectively ("across 18 modules") rather than listing every file.
 - Output ONLY the commit message. No code fences, no preamble.
 
 Example of GOOD grounding: if the digest shows 19 source files modified with no
@@ -673,11 +673,18 @@ this project — if it is not in the digest, it did not happen.
 GROUNDING RULES (most important):
 - Every bullet MUST correspond to a file or symbol that actually appears in the
   digest. Never invent features, bug fixes, or "security" items.
-- Write meaningful bullets that describe WHAT changed, grouped by theme — never
-  one bullet per file. Collapse many similar files into one bullet.
-- If a file has no "+symbols"/"-symbols", do not guess its internal purpose;
-  describe it at the level the digest supports ("add type-hint support").
+- You MAY name specific files, modules, functions, or classes from the digest —
+  that is exactly the kind of detail we want, as long as it is in the digest.
+- If a file has no "+symbols"/"-symbols", do not invent what its code does;
+  describe it at the level the digest supports (the file, its category, its size).
 - Do NOT guess intent words like "improve", "optimize", "simplify" without evidence.
+
+BE DETAILED:
+- Write a separate, informative bullet for EACH meaningful area of change:
+  new files/APIs, each modified subsystem, dependency/build, CI, docs, tests.
+- Prefer 6-12 specific bullets over a few vague ones. Name the key files.
+- Only collapse changes that are genuinely repetitive (e.g. a one-line bump
+  applied to many files).
 
 FORMAT (follow EXACTLY):
 ## Changelog
@@ -685,8 +692,8 @@ FORMAT (follow EXACTLY):
 ### {version}
 
 #### Added or Changed
-- <past-tense bullet>
-- <past-tense bullet>
+- <past-tense, detailed bullet>
+- <past-tense, detailed bullet>
 
 #### Removed
 - <past-tense bullet>
@@ -695,8 +702,7 @@ RULES:
 - Put every addition, change, fix, refactor, or new feature under "Added or Changed".
 - Put ONLY deletions/removals under "Removed". OMIT the entire "#### Removed"
   section if nothing was removed — never leave it empty.
-- Each bullet: past tense (Added/Changed/Fixed/Removed…), <=100 chars.
-- Aim for 3-7 bullets total.
+- Each bullet: past tense (Added/Changed/Fixed/Removed…), one complete line.
 - Output ONLY the Markdown. No code fences, no preamble.
 
 Worked example — digest "19 source modified, 4 added (py.typed, typing.py), 3 build, 1 ci":
@@ -705,9 +711,12 @@ Worked example — digest "19 source modified, 4 added (py.typed, typing.py), 3 
 ### {version}
 
 #### Added or Changed
-- Added type-hint support with a py.typed marker and typing module
-- Updated 18 source modules with type annotations
-- Updated build configuration and CI workflow
+- Added a py.typed marker so downstream projects pick up Flask's type hints
+- Added a new typing module with shared type aliases for the public API
+- Added typing dependencies (requirements/typing.in, requirements/typing.txt)
+- Updated 18 core source modules (app, blueprints, ctx, helpers, …) with annotations
+- Updated build configuration (setup.cfg, MANIFEST.in) for the typed package
+- Updated the CI workflow to run type checks
 
 {digest}
 """
@@ -866,6 +875,17 @@ def _file_names(files: list[FileChange], show: int = 3) -> str:
     return shown
 
 
+def _files_with_churn(files: list[FileChange], show: int = 5) -> str:
+    """List files (by name) with their +/- counts, heaviest first."""
+    ranked = sorted(files, key=lambda f: f.additions + f.deletions, reverse=True)
+    parts = [f"{f.path.rsplit('/', 1)[-1]} (+{f.additions}/-{f.deletions})"
+             for f in ranked[:show]]
+    shown = ", ".join(parts)
+    if len(files) > show:
+        shown += f", +{len(files) - show} more"
+    return shown
+
+
 def render_changelog(analysis: DiffAnalysis, version: str) -> str:
     """Build a grounded changelog in the Best-README-Template style directly
     from the analysis — "Added or Changed" + "Removed". No model, so no
@@ -888,20 +908,30 @@ def render_changelog(analysis: DiffAnalysis, version: str) -> str:
     changed_b, removed_b = [], []
 
     if added:
-        changed_b.append(f"Added {_plural(len(added), 'file')}: {_file_names(added)}")
+        changed_b.append(f"Added {_plural(len(added), 'file')}: {_file_names(added, 6)}")
     if new_syms:
-        changed_b.append(f"Added API: {sym_list(new_syms)}")
+        changed_b.append(f"Added public API: {sym_list(new_syms)}")
     src_mod = [f for f in modified if f.category == "source"]
     if src_mod:
-        changed_b.append(f"Updated {_plural(len(src_mod), 'source module')}")
-    other_mod = Counter(f.category for f in modified if f.category != "source")
-    for cat, n in other_mod.most_common():
-        changed_b.append(f"Updated {_plural(n, _CAT_NOUN.get(cat, 'file'))}")
+        changed_b.append(
+            f"Updated {_plural(len(src_mod), 'source module')}: "
+            f"{_files_with_churn(src_mod)}"
+        )
+    # other categories, each as its own detailed bullet with file names
+    other_cats: dict[str, list[FileChange]] = {}
+    for f in modified:
+        if f.category != "source":
+            other_cats.setdefault(f.category, []).append(f)
+    for cat, fs in sorted(other_cats.items(), key=lambda kv: -len(kv[1])):
+        changed_b.append(
+            f"Updated {_plural(len(fs), _CAT_NOUN.get(cat, 'file'))}: "
+            f"{_file_names(fs, 4)}"
+        )
 
     if deleted:
-        removed_b.append(f"Removed {_plural(len(deleted), 'file')}: {_file_names(deleted)}")
+        removed_b.append(f"Removed {_plural(len(deleted), 'file')}: {_file_names(deleted, 6)}")
     if gone_syms:
-        removed_b.append(f"Removed API: {sym_list(gone_syms)}")
+        removed_b.append(f"Removed public API: {sym_list(gone_syms)}")
 
     lines = ["## Changelog", "", f"### {version}"]
     if changed_b:
