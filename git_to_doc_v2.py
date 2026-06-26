@@ -11,8 +11,13 @@ The model never sees the raw diff cold. First a deterministic analyzer
 parses the diff's *structure* — files, change kinds, languages, added/
 removed symbols, dependency changes, breaking-change signals — resolves
 everything it can on its own, and hands Gemma a clean structured digest.
-The model is only asked to do what it is actually good at: write short
-prose for the parts that genuinely need judgement.
+
+Division of labour, chosen for accuracy:
+  • Commit message → Gemma writes the human narrative (judgement helps here),
+    then a deterministic validator repairs it to a spec-compliant header.
+  • Changelog     → generated deterministically from the parsed facts by
+    default, so it can never hallucinate, truncate, or come back empty.
+    Use --ai-changelog to have Gemma write it instead.
 
 Usage:
   python git_to_doc_v2.py <path/to/file.diff>
@@ -766,7 +771,8 @@ def enforce_commit_format(message: str, analysis: "DiffAnalysis") -> str:
     return "\n".join(lines).strip()
 
 
-def generate(analysis: DiffAnalysis, model: str, today: str) -> tuple[str, str]:
+def generate(analysis: DiffAnalysis, model: str, today: str,
+             ai_changelog: bool = False) -> tuple[str, str]:
     digest = build_digest(analysis)
     scopes = ", ".join(analysis.scopes) or "(infer from paths)"
 
@@ -785,17 +791,95 @@ def generate(analysis: DiffAnalysis, model: str, today: str) -> tuple[str, str]:
     # single source of truth: the type that actually shipped in the header
     resolved = parse_commit_type(commit) or analysis.type_guess
 
-    # changelog is told the resolved type so the two outputs never disagree
-    changelog = call_gemma(
-        CHANGELOG_PROMPT.format(ctype=resolved, today=today, digest=digest),
-        model,
-    )
-    if not changelog:
-        bucket = {"feat": "Added", "fix": "Fixed"}.get(resolved, "Changed")
-        changelog = f"### [Unreleased] — {today}\n\n#### {bucket}\n- {commit.splitlines()[0]}"
+    # Changelog: deterministic by default — built straight from the parsed facts
+    # so it can never hallucinate, truncate, or come back empty. The model is
+    # erratic at this on small/mid models, so we only use it when asked.
+    if ai_changelog:
+        changelog = call_gemma(
+            CHANGELOG_PROMPT.format(ctype=resolved, today=today, digest=digest),
+            model,
+        )
+        changelog = enforce_changelog_header(changelog, today) if changelog else ""
+        if not changelog or "####" not in changelog:   # model under-produced → fall back
+            changelog = render_changelog(analysis, today, resolved)
+    else:
+        changelog = render_changelog(analysis, today, resolved)
 
-    changelog = enforce_changelog_header(changelog, today)
     return commit, changelog
+
+
+# category → human noun used in deterministic changelog bullets
+_CAT_NOUN = {
+    "source": "source module", "docs": "doc file", "build": "build config file",
+    "ci": "CI workflow", "config": "config file", "test": "test file",
+    "example": "example file", "other": "file",
+}
+
+
+def _plural(n: int, noun: str) -> str:
+    return f"{n} {noun}" + ("s" if n != 1 else "")
+
+
+def _file_names(files: list[FileChange], show: int = 3) -> str:
+    shown = ", ".join(f.path for f in files[:show])
+    if len(files) > show:
+        shown += f", +{len(files) - show} more"
+    return shown
+
+
+def render_changelog(analysis: DiffAnalysis, today: str, ctype: str) -> str:
+    """Build a grouped, fully grounded changelog directly from the analysis.
+
+    Every line is derived from a real file or symbol — no model, so no
+    invention, no truncation, no empty output.
+    """
+    files = analysis.files
+    added = [f for f in files if f.kind == "added"]
+    deleted = [f for f in files if f.kind == "deleted"]
+    modified = [f for f in files if f.kind in ("modified", "renamed")]
+    # only public symbols from real source files are changelog-worthy API
+    new_syms = sorted({s for f in files if f.category == "source"
+                       for s in f.added_symbols if not s.startswith("_")})
+    gone_syms = sorted({s for f in files if f.category == "source"
+                        for s in f.removed_symbols if not s.startswith("_")})
+
+    def sym_list(syms: list[str]) -> str:
+        extra = f" (+{len(syms) - 6} more)" if len(syms) > 6 else ""
+        return ", ".join(syms[:6]) + extra
+
+    added_b, changed_b, fixed_b, removed_b = [], [], [], []
+
+    if added:
+        added_b.append(f"Add {_plural(len(added), 'file')}: {_file_names(added)}")
+    if new_syms:
+        added_b.append(f"Add API: {sym_list(new_syms)}")
+
+    if deleted:
+        removed_b.append(f"Remove {_plural(len(deleted), 'file')}: {_file_names(deleted)}")
+    if gone_syms:
+        removed_b.append(f"Remove API: {sym_list(gone_syms)}")
+
+    # modified files, grouped by category; source mods route to Fixed for a fix
+    src_mod = [f for f in modified if f.category == "source"]
+    if src_mod:
+        bullet = f"Update {_plural(len(src_mod), 'source module')}"
+        (fixed_b if ctype == "fix" else changed_b).append(bullet)
+    other_mod = Counter(f.category for f in modified if f.category != "source")
+    for cat, n in other_mod.most_common():
+        changed_b.append(f"Update {_plural(n, _CAT_NOUN.get(cat, 'file'))}")
+
+    sections = [("Added", added_b), ("Changed", changed_b),
+                ("Fixed", fixed_b), ("Removed", removed_b)]
+    lines = [f"### [Unreleased] — {today}"]
+    for head, bullets in sections:
+        if not bullets:
+            continue
+        lines.append("")
+        lines.append(f"#### {head}")
+        lines.extend(f"- {b}" for b in bullets)
+    if len(lines) == 1:                       # nothing classifiable — never empty
+        lines += ["", "#### Changed", f"- Update {_plural(len(files), 'file')}"]
+    return "\n".join(lines)
 
 
 def enforce_changelog_header(changelog: str, today: str) -> str:
@@ -942,6 +1026,7 @@ def main():
               python git_to_doc_v2.py pr_42.txt --model gemma3:1b
               python git_to_doc_v2.py changes.diff --output entry.md
               python git_to_doc_v2.py changes.diff --json
+              python git_to_doc_v2.py changes.diff --ai-changelog
         """),
     )
     parser.add_argument("diff_file", type=Path, help="Path to .diff or .txt file")
@@ -951,6 +1036,9 @@ def main():
                         help="Optional: save output to this .md file")
     parser.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON instead of formatted text")
+    parser.add_argument("--ai-changelog", action="store_true",
+                        help="Let Gemma write the changelog prose (default: "
+                             "deterministic, fully grounded changelog)")
     args = parser.parse_args()
 
     raw = load_diff(args.diff_file)
@@ -965,7 +1053,8 @@ def main():
         print(f"🔍  Analysing {args.diff_file.name} with {args.model} …", file=sys.stderr)
 
     today = date.today().isoformat()
-    commit_msg, changelog = generate(analysis, args.model, today)
+    commit_msg, changelog = generate(analysis, args.model, today,
+                                     ai_changelog=args.ai_changelog)
 
     print_results(commit_msg, changelog, analysis, args.json)
     if args.output:
